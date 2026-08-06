@@ -27,9 +27,10 @@ services:
     depends_on:
       - talk-daemon
     ports:
-      # ЛЕВОЕ — свободный порт ХОСТА (если 8081 занят другим ботом — поменяй, напр. 8086:8081,
-      # и пропиши BOT_PUBLIC_URL=http://<host>:8086 в .env). ПРАВОЕ = BUTTON_PORT в контейнере.
-      - "8081:8081"
+      # ЛЕВОЕ = BOT_HOST_PORT (свободный порт ХОСТА, напр. 8083), ПРАВОЕ = BUTTON_PORT
+      # (порт, который слушает бот ВНУТРИ контейнера). Оба берутся из .env.
+      # BOT_PUBLIC_URL в .env должен указывать на http://<host>:<BOT_HOST_PORT>.
+      - "${BOT_HOST_PORT:-8081}:${BUTTON_PORT:-8081}"
     volumes:
       - ./data:/app/data                 # та же БД, что у демона
       - ./Transcripts:/app/Transcripts   # те же файлы (бот отдаёт их в Tag)
