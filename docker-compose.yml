@@ -1,0 +1,36 @@
+# Два сервиса на ОДНОМ образе:
+#   talk-daemon — архивирует записи (ffmpeg + ASR + LLM + БД + удаление);
+#   talk-bot    — интерактивный бот Tag (кнопки/модалка/выдача файлов, алерты админам).
+# Общие тома: data (SQLite-БД), Transcripts (файлы расшифровок), logs.
+# Первый прогон — с SEND_TO_TAG=0 в .env (наполнить архивы, никому не слать).
+services:
+  talk-daemon:
+    build: .
+    image: talk-archiver-nikiforov:latest
+    container_name: talk-daemon-nikiforov
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python main.py
+    volumes:
+      - ./data:/app/data                 # SQLite-БД (общая с ботом)
+      - ./Transcripts:/app/Transcripts   # расшифровки/выжимки
+      - ./logs:/app/logs
+
+  talk-bot:
+    image: talk-archiver-nikiforov:latest   # тот же образ, что собрал talk-daemon
+    container_name: talk-bot-nikiforov
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python bot.py
+    depends_on:
+      - talk-daemon
+    ports:
+      # ЛЕВОЕ — свободный порт ХОСТА (если 8081 занят другим ботом — поменяй, напр. 8086:8081,
+      # и пропиши BOT_PUBLIC_URL=http://<host>:8086 в .env). ПРАВОЕ = BUTTON_PORT в контейнере.
+      - "8081:8081"
+    volumes:
+      - ./data:/app/data                 # та же БД, что у демона
+      - ./Transcripts:/app/Transcripts   # те же файлы (бот отдаёт их в Tag)
+      - ./logs:/app/logs

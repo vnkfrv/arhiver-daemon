@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.env
+transcripts/
+Transcripts/
+_transcripts_backup_*/
+data/
+logs/
+state.json
+*.db
+*.db-shm
+*.db-wal
+*.zip
+*.log
+*.mp4

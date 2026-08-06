@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+Transcripts/
+transcripts/
+_transcripts_backup_*/
+data/
+logs/
+state.json
+.env
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.mp4
+*.zip
+TestRecord/
+.git/
