@@ -13,3 +13,7 @@ state.json
 *.zip
 *.log
 *.mp4
+# служебное/мусор
+.DS_Store
+logggs.txt
+stuff/

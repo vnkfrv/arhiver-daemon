@@ -26,6 +26,15 @@ services:
     command: python bot.py
     depends_on:
       - talk-daemon
+    # /health отвечает всегда, пока бот жив -> restart реагирует на «зависание», не только
+    # на падение процесса. (Демону healthcheck не ставим: в простое между окнами он молчит.)
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('BUTTON_PORT','8081')+'/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     ports:
       # ЛЕВОЕ = BOT_HOST_PORT (свободный порт ХОСТА, напр. 8083), ПРАВОЕ = BUTTON_PORT
       # (порт, который слушает бот ВНУТРИ контейнера). Оба берутся из .env.

@@ -35,24 +35,17 @@ import logsetup
 import statuses
 import store
 import pipeline
+import notify
 from pipeline import Ctx
 from config import load_cfg
 from talk_api import TalkClient
 from asr import get_asr
 from llm import get_llm
+from util import err as _err, parse_dt as _parse_dt
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 log = logging.getLogger("daemon")
-
-
-def _parse_dt(s):
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 def _now_iso():
@@ -69,15 +62,6 @@ def _start_of_today_utc():
 
 def _local_now():
     return datetime.now().astimezone()
-
-
-def _seconds_until(hh, mm):
-    """Секунд до ближайшего наступления времени HH:MM (сегодня или завтра)."""
-    now = _local_now()
-    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return max(1.0, (target - now).total_seconds())
 
 
 def _windows(cfg):
@@ -108,18 +92,15 @@ def _next_boundary_secs(cfg):
 
 
 def _sleep_secs(cfg):
-    """Сколько спать до следующей проверки."""
+    """Сколько спать до следующей проверки. Темп всегда задаётся окнами (они обязательны)."""
     now = _local_now()
-    if _windows(cfg):
-        if _any_open(cfg, now):
-            b = _next_boundary_secs(cfg)  # спим до смены фазы, но не дольше 5 мин
-            return min(b, 300.0) if b else 300.0
-        # все окна закрыты — спим до ближайшего открытия
-        opens = [config.next_open_local(now, w) for w in _windows(cfg)]
-        opens = [o for o in opens if o]
-        return max(1.0, (min(opens) - now).total_seconds()) if opens else 300.0
-    # окон нет: test — короткий цикл, prod — раз в сутки в RUN_AT
-    return cfg.cycle_sec if cfg.mode == "test" else _seconds_until(*cfg.run_at)
+    if _any_open(cfg, now):
+        b = _next_boundary_secs(cfg)  # спим до смены фазы, но не дольше 5 мин
+        return min(b, 300.0) if b else 300.0
+    # все окна закрыты — спим до ближайшего открытия
+    opens = [config.next_open_local(now, w) for w in _windows(cfg)]
+    opens = [o for o in opens if o]
+    return max(1.0, (min(opens) - now).total_seconds()) if opens else 300.0
 
 
 def _enroll(ctx, key, meta):
@@ -169,23 +150,27 @@ def _discover(ctx):
     since = db.max_created(ctx.db)
     discovered = shortdel = 0
     for meta in ctx.client.list(since=since, order="byTimeOldFirst"):
-        dt = _parse_dt(meta.get("createdDate"))
-        if dt is None:
+        try:
+            dt = _parse_dt(meta.get("createdDate"))
+            if dt is None:
+                continue
+            if dt >= cutoff:  # дошли до записей текущего дня — стоп
+                break
+            key = meta.get("key")
+            if not key or db.exists(ctx.db, key):
+                continue
+            dur = meta.get("duration")
+            if dur is not None and dur < cfg.min_duration:   # слишком короткая -> удалить
+                _handle_short(ctx, key, meta, dur)
+                shortdel += 1
+                continue
+            # В элементе списка v2 уже есть title/duration/canBeRemoved/createdDate —
+            # отдельный recording_detail на КАЖДУЮ запись не нужен (критично на «горе»).
+            _enroll(ctx, key, meta)
+            discovered += 1
+        except Exception as ex:      # один битый элемент не должен рвать весь подхват
+            log.warning("подхват записи %s пропущен: %s", meta.get("key"), _err(ex))
             continue
-        if dt >= cutoff:  # дошли до записей текущего дня — стоп
-            break
-        key = meta.get("key")
-        if not key or db.exists(ctx.db, key):
-            continue
-        dur = meta.get("duration")
-        if dur is not None and dur < cfg.min_duration:   # слишком короткая -> удалить
-            _handle_short(ctx, key, meta, dur)
-            shortdel += 1
-            continue
-        # В элементе списка v2 уже есть title/duration/canBeRemoved/createdDate —
-        # отдельный recording_detail на КАЖДУЮ запись не нужен (критично на «горе»).
-        _enroll(ctx, key, meta)
-        discovered += 1
     if shortdel:
         log.info("подхват: коротких (< %dс) удалено/помечено: %d", cfg.min_duration, shortdel)
     return discovered
@@ -238,7 +223,8 @@ def _run_active(ctx):
             with lock:
                 stats["worked"] += 1
             still = pipeline.stages_pending(
-                row, cfg, llm_ok, bool(row.get("protected"))
+                row, cfg, llm_ok, bool(row.get("protected")),
+                old_records_done=pipeline._old_records_done(ctx),
             )
             log.info(
                 "✓ %s | %s%s",
@@ -247,7 +233,8 @@ def _run_active(ctx):
                 (" | осталось: " + ",".join(still)) if still else "",
             )
         except Exception as ex:
-            log.exception("✗ ошибка обработки %s: %s", key, ex)
+            # краткий лог (без простыни трейсбека): детали стадий уже залогированы внутри
+            log.error("✗ ошибка обработки %s: %s", key, _err(ex))
             try:  # анти-тайтлуп: отодвинуть next_due, чтобы упавшая запись не крутилась
                 db.update(
                     ctx.db,
@@ -355,15 +342,106 @@ def _check_emergency(ctx):
                         % (ctx.cfg.emergency_hours, str(oldest)[:19]))
 
 
+# --- OLD-RECORDS: единоразовое уведомление о старых записях (раз в сутки) ----
+_last_old_records_check = None      # дата последней суточной проверки фазы
+_old_records_thread = None          # фоновый поток рассылки (чтобы не блокировать тик)
+
+
+def _old_records_phase(ctx):
+    """Если бэклог старых записей (старше DELETE_VIDEO_AGE_DAYS) полностью обработан —
+    разослать единоразовое уведомление ожидающим пользователям и, когда уведомлены ВСЕ,
+    выставить флаг old_records_all_notified=1 и запланировать удаление бэклога.
+    Ничего не делает при сухом прогоне (нет ни одного канала) или если флаг уже выставлен."""
+    cfg = ctx.cfg
+    if db.get_meta(ctx.db, pipeline.OLD_RECORDS_FLAG) == "1":
+        return                                          # фаза уже завершена
+    need_tag = ctx.mm is not None                       # Tag-канал реально доступен
+    need_mail = cfg.send_to_mail
+    if not (need_tag or need_mail):
+        return                                          # сухой прогон — не уведомляем/не удаляем
+
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=cfg.delete_video_age_days)).isoformat()
+    pending_backlog = db.backlog_pending_count(ctx.db, cutoff)
+    if pending_backlog > 0:
+        log.info("old-records: бэклог ещё обрабатывается (осталось %d) — рассылка позже",
+                 pending_backlog)
+        return
+
+    pending_users = db.list_users_pending(ctx.db, need_tag=need_tag, need_mail=need_mail)
+    if pending_users:
+        log.info("old-records: рассылка уведомлений (%d пользователей, tag=%s, mail=%s)",
+                 len(pending_users), need_tag, need_mail)
+        for login, tag_ok, mail_ok in notify.send_old_records_notifications(
+                pending_users, mm=ctx.mm, send_mail=need_mail):
+            try:
+                db.set_notified_of_old_records(
+                    ctx.db, login,
+                    tag=True if tag_ok else None,       # ставим флаг только по РЕАЛЬНОЙ доставке
+                    mail=True if mail_ok else None)
+            except Exception as ex:                     # одна ошибка БД не рвёт всю рассылку
+                log.warning("old-records: не обновил флаг @%s: %s", login, _err(ex))
+
+    if db.all_users_notified(ctx.db, need_tag=need_tag, need_mail=need_mail):
+        now = datetime.now(timezone.utc)
+        delete_at = (now + timedelta(seconds=cfg.delete_delay_sec)).isoformat()
+        n = db.mark_backlog_for_deletion(ctx.db, cutoff, delete_at)
+        db.set_meta(ctx.db, "old_records_notified_at", now.isoformat())
+        db.set_meta(ctx.db, pipeline.OLD_RECORDS_FLAG, "1")
+        log.info("old-records: ВСЕ уведомлены -> флаг выставлен; удаление %d записей бэклога "
+                 "назначено на %s", n, delete_at)
+
+
+def _run_old_records_phase(ctx):
+    try:
+        _old_records_phase(ctx)
+    except Exception as ex:
+        log.warning("old-records-фаза: сбой: %s", _err(ex))
+
+
+def _maybe_old_records_phase(ctx):
+    """Гоняем old-records-фазу не чаще раза в сутки (по календарной дате), в ФОНОВОМ потоке —
+    рассылка тысячам пользователей не должна блокировать обработку записей в главном цикле."""
+    global _last_old_records_check, _old_records_thread
+    if _last_old_records_check == datetime.now().date():
+        return
+    if _old_records_thread is not None and _old_records_thread.is_alive():
+        return                       # предыдущая рассылка ещё идёт — дату не двигаем, ждём
+    _last_old_records_check = datetime.now().date()
+    _old_records_thread = threading.Thread(target=_run_old_records_phase, args=(ctx,),
+                                           name="old-records", daemon=True)
+    _old_records_thread.start()
+
+
+_last_mm_attempt = 0.0      # монотонное время последней попытки поднять клиент Tag
+
+
+def _ensure_mm(ctx):
+    """Если SEND_TO_TAG=1, а клиент Tag не поднят (был недоступен на старте демона) —
+    пробуем поднять его снова, не чаще раза в 5 минут. Иначе разовый сбой Tag на старте
+    отключил бы ЛС до перезапуска демона."""
+    global _last_mm_attempt
+    if not ctx.cfg.send_to_tag or ctx.mm is not None:
+        return
+    now = time.monotonic()
+    if now - _last_mm_attempt < 300:
+        return
+    _last_mm_attempt = now
+    ctx.mm = _build_mm(ctx.cfg)
+    if ctx.mm is not None:
+        log.info("клиент Tag поднят повторно (был недоступен ранее)")
+
+
 def tick(ctx):
     """Один проход: подхват (если ASR-окно открыто) + параллельная обработка."""
     cfg = ctx.cfg
+    _ensure_mm(ctx)               # переподнять клиент Tag, если он отвалился на старте
     llm_ok = bool(ctx.llm and ctx.llm.available())
     now = _local_now()
     asr_on = (not cfg.asr_window) or config.in_window(now, cfg.asr_window)
     log.info(
-        "=== тик [MODE=%s]: LLM=%s, ASR-окно=%s, LLM-окно=%s, воркеров=%d ===",
-        cfg.mode,
+        "=== тик [REAL_DELETE=%d]: LLM=%s, ASR-окно=%s, LLM-окно=%s, воркеров=%d ===",
+        int(cfg.real_delete),
         "вкл" if llm_ok else "выкл",
         "откр" if asr_on else "закр",
         (
@@ -373,11 +451,17 @@ def tick(ctx):
         ),
         cfg.record_workers,
     )
+    # Подхват и обработка — в РАЗДЕЛЬНЫХ try: сбой discovery (напр. Talk недоступен) не
+    # должен ни ронять демон гигантским трейсбеком, ни мешать обработке уже заведённых.
     if asr_on:
-        log.info(
-            "подхвачено новых: %d", _discover(ctx)
-        )  # новые записи для транскрибации
-    log.info("обработано записей: %d", _run_active(ctx))
+        try:
+            log.info("подхвачено новых: %d", _discover(ctx))
+        except Exception as ex:
+            log.warning("подхват новых записей не удался (продолжаю обработку): %s", _err(ex))
+    try:
+        log.info("обработано записей: %d", _run_active(ctx))
+    except Exception as ex:
+        log.warning("цикл обработки прерван, повтор на след. проходе: %s", _err(ex))
 
 
 def _build_mm(cfg):
@@ -423,8 +507,9 @@ def main():
     ctx = build_ctx()
     cfg = ctx.cfg
     log.info(
-        "старт демона: MODE=%s, out_dir=%s, db=%s, ASR-окно=%s, LLM-окно=%s, воркеров=%d",
-        cfg.mode,
+        "старт демона: REAL_DELETE=%d, SEND_TO_TAG=%d, SEND_TO_MAIL=%d, out_dir=%s, db=%s, "
+        "ASR-окно=%s, LLM-окно=%s, воркеров=%d",
+        int(cfg.real_delete), int(cfg.send_to_tag), int(cfg.send_to_mail),
         cfg.out_dir,
         cfg.db_path,
         cfg.asr_window,
@@ -448,6 +533,7 @@ def main():
         try:
             tick(ctx)
             _check_emergency(ctx)          # долгая недоступность шлюза -> алерт админам
+            _maybe_old_records_phase(ctx)  # раз в сутки: единоразовое old-records-уведомление
         except Exception as ex:
             log.exception("сбой тика: %s", ex)
         if args.once:

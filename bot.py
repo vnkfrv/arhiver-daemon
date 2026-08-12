@@ -8,7 +8,7 @@ bot.py — ИНТЕРАКТИВНЫЙ БОТ Tag (Mattermost). Этап B.
 Что умеет:
   1. ЛС + любое сообщение боту -> help-сообщение с кнопкой «Найти видеозапись».
      (Бот общается ТОЛЬКО в ЛС; сообщения из каналов игнорирует.)
-  2. Кнопки уведомления «Видеозапись»/«Вся расшифровка»/«Короткая выжимка»
+  2. Кнопки уведомления «Видеозапись»/«Сырая расшифровка»/«Улучшенная расшифровка»/«Короткая выжимка»
      -> соответствующий файл В ВЕТКУ. Если видео уже удалено — «Видеозапись была
      уже удалена😔» (1 раз на ветку).
   3. Кнопка «Найти видеозапись» -> модалка «Видеозаписи» с двумя select-полями
@@ -31,14 +31,19 @@ import ssl
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 from flask import Flask, request, jsonify
 
 import db
 import statuses
+import store
 from config import load_cfg
-from mm_client import MMClient, FIND_ACTIONS
+from mm_client import MMClient
 from talk_api import TalkClient
+from texts import (HELP_TEXT, ALREADY_DELETED, SOON, NO_RECORDS, NOT_FOUND, NOT_READY,
+                   DELIVER_FAIL, RECORD_LABEL, FILE_ACTIONS,
+                   DIALOG_TITLE, DIALOG_SUBMIT, DIALOG_SELECT_RECORD, DIALOG_SELECT_TYPE)
 
 log = logging.getLogger("bot")
 
@@ -46,16 +51,6 @@ log = logging.getLogger("bot")
 RE_NEWADMIN = re.compile(r"^newadmin_(.+)$", re.IGNORECASE)
 RE_REMEMBER = re.compile(r"^remember_(.+)$", re.IGNORECASE)
 RE_DELETE = re.compile(r"^delete_(.+)$", re.IGNORECASE)
-
-HELP_TEXT = (
-    "Привет, {name}! 👋\n\n"
-    "Бот-архиватор удаляет записи видеоконференций Talk, записанные более года "
-    "назад и предоставляет возможность скачивания полной текстовой расшифровки и "
-    "сжатой выжимки, которые подготавливаются на следующий день после "
-    "видеоконференции и будут храниться 5 лет после удаления видеозаписи"
-)
-ALREADY_DELETED = "Видеозапись была уже удалена😔"
-SOON = "Скоро пришлю файл…."
 
 cfg = load_cfg()
 conn = db.connect(cfg.db_path)
@@ -69,29 +64,52 @@ app = Flask(__name__)
 # =========================================================================
 
 def _fmt_option(row):
-    """Подпись записи в select: «{название} - ДД.ММ.ГГГГ»."""
+    """Подпись записи: «ДД.ММ.ГГГГ - Название - X мин.» (select-опция и подпись к файлу)."""
     d = row.get("created_date") or ""
     try:
         dt = datetime.fromisoformat(d.replace("Z", "+00:00")).astimezone().strftime("%d.%m.%Y")
     except ValueError:
         dt = d[:10]
-    return f"{row.get('title') or 'без названия'} - {dt}"
+    minutes = round((row.get("duration_sec") or 0) / 60)
+    return RECORD_LABEL.format(date=dt, title=row.get("title") or "без названия", minutes=minutes)
+
+
+def _first_existing(*paths):
+    """Первый из путей, который существует на диске (или None). Пустые/None пропускаем.
+    Нужен для обратной совместимости: у старых записей файлы называются <ID>_full.md."""
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def _text_path(row, key, kind):
+    """Путь к текстовому файлу записи по типу (asr/llm/short) c fallback на старый _full.md."""
+    rd = row.get("rec_dir") or ""
+    if kind == "asr":            # базовая (дословная) расшифровка
+        return _first_existing(store.asr_path(rd, key), store._old_full_path(rd, key))
+    if kind == "llm":            # улучшенная (LLM) расшифровка
+        return _first_existing(store.llm_path(rd, key), row.get("full_path"),
+                               store._old_full_path(rd, key))
+    return _first_existing(row.get("short_path"), store.short_path(rd, key))  # краткая выжимка
 
 
 def _deliver(channel_id, root_id, key, action):
-    """Положить нужный файл в ветку root_id. Выполняется в отдельном потоке."""
+    """Положить нужный файл(ы) в ветку root_id. Выполняется в отдельном потоке."""
     try:
         row = db.get(conn, key)
         if not row:
-            mm.post(channel_id, "Запись не найдена в базе.", root_id=root_id)
+            mm.post(channel_id, NOT_FOUND, root_id=root_id)
             return
 
-        if action in ("full", "short"):
-            path = row["full_path"] if action == "full" else row["short_path"]
-            if path and os.path.exists(path):
-                mm.post_file(channel_id, path, root_id=root_id)
+        if action in ("asr", "llm", "short", "all"):
+            caption = _fmt_option(row)     # «ДД.ММ.ГГГГ - Название - X мин.»
+            kinds = ("asr", "llm", "short") if action == "all" else (action,)
+            paths = [p for p in (_text_path(row, key, k) for k in kinds) if p]
+            if paths:
+                mm.post_files(channel_id, paths, message=caption, root_id=root_id)
             else:
-                mm.post(channel_id, "Файл ещё не готов.", root_id=root_id)
+                mm.post(channel_id, NOT_READY, root_id=root_id)
             return
 
         if action == "video":
@@ -113,7 +131,7 @@ def _deliver(channel_id, root_id, key, action):
     except Exception as ex:
         log.exception("доставка файла (%s, %s) не удалась: %s", key, action, ex)
         try:
-            mm.post(channel_id, "Не удалось отправить файл, попробуй ещё раз.", root_id=root_id)
+            mm.post(channel_id, DELIVER_FAIL, root_id=root_id)
         except Exception:
             pass
 
@@ -144,7 +162,7 @@ def action():
         data = request.get_json(force=True, silent=True) or {}
         ctx = data.get("context") or {}
         act = ctx.get("action")
-        if act in ("video", "full", "short"):
+        if act in ("video", "asr", "llm", "short", "all"):
             _deliver_async(data.get("channel_id"), data.get("post_id"), ctx.get("key"), act)
         elif act == "find":
             _open_find_dialog(data)
@@ -166,20 +184,20 @@ def _open_find_dialog(data):
     rows = db.list_for_email(conn, email) if email else []
 
     if not rows:
-        mm.post(channel_id, "Пока нет доступных видеозаписей.", root_id=post_id)
+        mm.post(channel_id, NO_RECORDS, root_id=post_id)
         return
 
     dialog = {
         "callback_id": "find_video",
-        "title": "Видеозаписи",
-        "submit_label": "Готово",
+        "title": DIALOG_TITLE,
+        "submit_label": DIALOG_SUBMIT,
         # state несёт, куда потом класть файл (в ту же ветку)
         "state": json.dumps({"channel_id": channel_id, "root_id": post_id}),
         "elements": [
-            {"display_name": "Выберите видеозапись", "name": "recording", "type": "select",
+            {"display_name": DIALOG_SELECT_RECORD, "name": "recording", "type": "select",
              "options": [{"text": _fmt_option(r), "value": r["recording_key"]} for r in rows]},
-            {"display_name": "Выберите действие", "name": "do", "type": "select",
-             "options": [{"text": label, "value": val} for val, label in FIND_ACTIONS]},
+            {"display_name": DIALOG_SELECT_TYPE, "name": "do", "type": "select",
+             "options": [{"text": label, "value": val} for val, label in FILE_ACTIONS]},
         ],
     }
     mm.open_dialog(trigger_id, mm.dialog_url(), dialog)
@@ -388,7 +406,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.FileHandler(os.path.join(log_dir, "bot.log")),
+        handlers=[RotatingFileHandler(os.path.join(log_dir, "bot.log"),
+                                      maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
                   logging.StreamHandler()])
     # werkzeug пишет строку каждого запроса (с ?t=<секрет>) — глушим access-лог,
     # чтобы BUTTON_SECRET не утекал в bot.log.

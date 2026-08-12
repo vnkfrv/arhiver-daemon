@@ -25,6 +25,12 @@ _RETRY_ATTEMPTS = 3      # логика ретраев такая же, как �
 _RETRY_BACKOFF = 3.0
 
 
+class LLMTruncated(Exception):
+    """Ответ модели обрезан лимитом выходных токенов (finish_reason == 'length').
+    Текст НЕПОЛНЫЙ — вызывающий код (enrich) должен уменьшить вход и повторить,
+    иначе часть расшифровки потеряется. Не транзиентная ошибка, ретраить бессмысленно."""
+
+
 class MagnitLLM:
     def __init__(self):
         env = load_env()
@@ -49,29 +55,34 @@ class MagnitLLM:
         return bool(self.key and self.model)
 
     def chat(self, system: str, user: str, temperature: float = 0.2,
-             timeout: int = 600) -> str:
+             timeout: int = 600, max_tokens: int = None) -> str:
         """
         Отправить одно сообщение в чат-модель и вернуть текст ответа.
         system — инструкция («кто ты и что делаешь»), user — сам текст на обработку.
         temperature=0.2 — низкая «креативность»: для редактуры нам нужна
         предсказуемость, а не фантазия модели.
+        max_tokens — верхний лимит длины ответа (если задан). При обрыве ответа по
+        этому лимиту бросаем LLMTruncated, чтобы enrich уменьшил вход и не потерял текст.
         """
         last = None
         for attempt in range(_RETRY_ATTEMPTS):
             try:
                 get_limiter().acquire()      # общий лимит шлюза (30/мин), считая ретраи
+                payload = {"model": self.model,
+                           "messages": [{"role": "system", "content": system},
+                                        {"role": "user", "content": user}],
+                           "temperature": temperature,
+                           "stream": False,
+                           # отключаем «мышление» модели (быстрее, без лишних токенов)
+                           "chat_template_kwargs": {"thinking": self.thinking}}
+                if max_tokens:
+                    payload["max_tokens"] = int(max_tokens)
                 r = requests.post(
                     f"{self.base}/chat/completions",
                     headers={"Authorization": f"Bearer {self.key}",
                              "Content-Type": "application/json"},
                     # json=... сам сериализует dict и ставит правильный Content-Type.
-                    json={"model": self.model,
-                          "messages": [{"role": "system", "content": system},
-                                       {"role": "user", "content": user}],
-                          "temperature": temperature,
-                          "stream": False,
-                          # отключаем «мышление» модели (быстрее, без лишних токенов)
-                          "chat_template_kwargs": {"thinking": self.thinking}},
+                    json=payload,
                     verify=self.verify, timeout=timeout)
                 if 400 <= r.status_code < 500:      # клиентская ошибка — не повторяем
                     r.raise_for_status()
@@ -79,7 +90,13 @@ class MagnitLLM:
                     raise requests.HTTPError(f"{r.status_code} server error", response=r)
                 data = r.json()
                 # Стандартная форма ответа OpenAI-совместимого API.
-                return data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]
+                # finish_reason == "length" => модель упёрлась в лимит вывода и оборвала
+                # ответ на полуслове. Возвращать нельзя — потеряем хвост. Сигналим наверх.
+                if choice.get("finish_reason") == "length":
+                    raise LLMTruncated(
+                        f"ответ обрезан лимитом вывода (max_tokens={max_tokens})")
+                return choice["message"]["content"]
             except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code and 400 <= code < 500:

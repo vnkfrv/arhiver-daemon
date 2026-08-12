@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     deleted             INTEGER DEFAULT 0,
     text_cleaned        INTEGER DEFAULT 0,
     no_audio            INTEGER DEFAULT 0,
+    asr_attempts        INTEGER DEFAULT 0,   -- сколько раз транскрибация падала (не 400/404)
     delete_simulated    INTEGER DEFAULT 0,
     protected           INTEGER DEFAULT 0,   -- админ: «хранить в Толке навсегда»
     can_be_removed      INTEGER DEFAULT 0,
@@ -87,13 +88,38 @@ CREATE TABLE IF NOT EXISTS admins (
     added_by  TEXT,
     added_at  TEXT
 );
+
+-- Пользователи (участники конференций) как отдельная сущность (не привязка к записи).
+--   id    — локальный автоинкремент; login — идентификатор из Толка (username = тело почты до @).
+--   notified_of_old_records_tag / _mail — булевы флаги (0/1): уведомлён ли пользователь
+--   о старых записях по каждому каналу (раздельно, т.к. каналы независимы и у почты лимиты).
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    login       TEXT UNIQUE,
+    email       TEXT UNIQUE,
+    first_name  TEXT,
+    last_name   TEXT,
+    notified_of_old_records_tag  INTEGER NOT NULL DEFAULT 0,
+    notified_of_old_records_mail INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT,
+    updated_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- Служебное key-value состояние демона (флаги фаз и т.п.).
+--   old_records_all_notified — «все пользователи уведомлены о старых записях» (0/1).
+--   old_records_notified_at  — ISO-момент, когда флаг стал 1 (старт grace-периода удаления).
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
 """
 
 # Колонки, которые разрешено менять через update() (защита от произвольного SQL).
 _UPDATABLE = {
     "title", "created_date", "duration_sec", "participants", "status", "rec_dir",
     "full_path", "short_path", "transcribed", "improved", "summarized", "saved_to_db",
-    "messages_sent", "deleted", "text_cleaned", "no_audio", "delete_simulated",
+    "messages_sent", "deleted", "text_cleaned", "no_audio", "asr_attempts", "delete_simulated",
     "protected", "can_be_removed", "delete_scheduled_at", "deleted_at", "text_delete_at",
     "notified_usernames", "last_error", "error_since", "done", "next_due_at",
 }
@@ -127,6 +153,8 @@ def connect(path):
     have = {r[1] for r in conn.execute("PRAGMA table_info(recordings)")}
     if "error_since" not in have:
         conn.execute("ALTER TABLE recordings ADD COLUMN error_since TEXT")
+    if "asr_attempts" not in have:
+        conn.execute("ALTER TABLE recordings ADD COLUMN asr_attempts INTEGER DEFAULT 0")
     conn.commit()
     return conn
 
@@ -293,3 +321,141 @@ def oldest_error(conn):
     r = conn.execute("SELECT MIN(error_since) FROM recordings "
                      "WHERE error_since IS NOT NULL AND done=0").fetchone()
     return r[0] if r and r[0] else None
+
+
+# ---- пользователи (таблица users) ------------------------------------------
+
+@_locked
+def upsert_user(conn, *, login, email=None, first_name=None, last_name=None):
+    """Создать/обновить пользователя по login (идемпотентно). Флаг notified_of_old_records
+    при обновлении НЕ трогаем. COALESCE — не затираем существующие поля, если пришло None.
+    Возвращает id пользователя."""
+    now = _now()
+    conn.execute(
+        "INSERT INTO users (login, email, first_name, last_name, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(login) DO UPDATE SET "
+        "  email=COALESCE(excluded.email, users.email), "
+        "  first_name=COALESCE(excluded.first_name, users.first_name), "
+        "  last_name=COALESCE(excluded.last_name, users.last_name), "
+        "  updated_at=excluded.updated_at",
+        (login, email, first_name, last_name, now, now))
+    conn.commit()
+    r = conn.execute("SELECT id FROM users WHERE login=?", (login,)).fetchone()
+    return r[0] if r else None
+
+
+@_locked
+def get_user(conn, login):
+    """Пользователь по login (или None)."""
+    r = conn.execute("SELECT * FROM users WHERE login=?", (login,)).fetchone()
+    return dict(r) if r else None
+
+
+@_locked
+def get_user_by_email(conn, email):
+    """Пользователь по email (или None)."""
+    r = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    return dict(r) if r else None
+
+
+@_locked
+def set_notified_of_old_records(conn, login, *, tag=None, mail=None):
+    """Проставить/снять флаги уведомления о старых записях. tag/mail — True/False/None
+    (None = не трогать этот канал)."""
+    sets, params = [], []
+    if tag is not None:
+        sets.append("notified_of_old_records_tag=?"); params.append(1 if tag else 0)
+    if mail is not None:
+        sets.append("notified_of_old_records_mail=?"); params.append(1 if mail else 0)
+    if not sets:
+        return
+    sets.append("updated_at=?"); params.append(_now())
+    params.append(login)
+    conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE login=?", params)
+    conn.commit()
+
+
+@_locked
+def list_users_pending(conn, *, need_tag, need_mail):
+    """Пользователи, которым ещё НЕ отправлено old-records-уведомление хотя бы по одному
+    ТРЕБУЕМОМУ каналу (need_tag/need_mail — включён ли канал). Если ни один канал не
+    требуется — пустой список (слать некуда)."""
+    conds = []
+    if need_tag:
+        conds.append("notified_of_old_records_tag=0")
+    if need_mail:
+        conds.append("notified_of_old_records_mail=0")
+    if not conds:
+        return []
+    rows = conn.execute(
+        f"SELECT * FROM users WHERE {' OR '.join(conds)} ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+@_locked
+def all_users_notified(conn, *, need_tag, need_mail):
+    """True, если по всем ТРЕБУЕМЫМ каналам уведомлены все пользователи (и юзеры вообще
+    есть). Если ни один канал не требуется — считаем False (рассылать нечем)."""
+    if not (need_tag or need_mail):
+        return False
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        return False
+    conds = []
+    if need_tag:
+        conds.append("notified_of_old_records_tag=0")
+    if need_mail:
+        conds.append("notified_of_old_records_mail=0")
+    pending = conn.execute(
+        f"SELECT COUNT(*) FROM users WHERE {' OR '.join(conds)}").fetchone()[0]
+    return pending == 0
+
+
+@_locked
+def list_users(conn):
+    """Все пользователи (list[dict])."""
+    return [dict(r) for r in conn.execute("SELECT * FROM users ORDER BY id").fetchall()]
+
+
+# ---- служебное состояние (таблица meta) ------------------------------------
+
+@_locked
+def get_meta(conn, key, default=None):
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+@_locked
+def set_meta(conn, key, value):
+    conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))
+    conn.commit()
+
+
+@_locked
+def mark_backlog_for_deletion(conn, cutoff_iso, delete_at_iso):
+    """При флипе флага «все уведомлены»: пометить ВСЕ старые (created<cutoff) сохранённые
+    записи как уже уведомлённые (messages_sent=1 — единоразовая рассылка их покрыла) и
+    назначить срок удаления видео. Защищённые (remember) и уже удалённые не трогаем.
+    Возвращает число помеченных."""
+    now = _now()
+    cur = conn.execute(
+        "UPDATE recordings SET messages_sent=1, delete_scheduled_at=?, "
+        "done=0, next_due_at=?, updated_at=? "
+        "WHERE created_date < ? AND saved_to_db=1 AND messages_sent=0 "
+        "AND deleted=0 AND protected=0",
+        (delete_at_iso, delete_at_iso, now, cutoff_iso))
+    conn.commit()
+    return cur.rowcount
+
+
+@_locked
+def backlog_pending_count(conn, cutoff_iso):
+    """Сколько записей СТАРШЕ порога (created_date < cutoff_iso) ещё НЕ доведены до конца
+    бэкфилла: не сохранены в БД, не «нет аудио», не терминальны (done). 0 => бэклог
+    старых записей полностью перелопачен (можно рассылать old-records-уведомление)."""
+    r = conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE created_date < ? "
+        "AND saved_to_db=0 AND no_audio=0 AND done=0", (cutoff_iso,)).fetchone()
+    return r[0]

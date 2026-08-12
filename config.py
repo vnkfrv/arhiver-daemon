@@ -5,13 +5,13 @@ config.py — единая загрузка и ВАЛИДАЦИЯ конфигу
 необязателен: без ключа шаг «улучшения»/«выжимки» пропускается, демон вернётся к нему,
 когда LLM появится.
 
-РЕЖИМЫ (MODE): различаются ТОЛЬКО удалением и темпом — логика подхвата одинакова
-(все записи из API, от старых к новым).
-  prod — раз в сутки (в RUN_AT, по умолч. 00:01) транскрибируем записи ПРОШЛОГО дня
-         (текст доступен на следующий день); видео старше года — уведомляем участников
-         и РЕАЛЬНО удаляем через неделю. Тексты храним 5 лет после удаления видео.
-  test — то же самое, но удаление ИМИТИРУЕМ (только лог, видео не трогаем), задержка
-         короче (по умолч. 180с) и цикл частый (TEST_CYCLE_SEC) — «сухой прогон» прода.
+Вместо единого MODE — ортогональные флаги (логика подхвата одинакова всегда: все
+записи из API, от старых к новым; темп всегда задаётся рабочими окнами):
+  REAL_DELETE  — 1: реально удаляем видео из Talk; 0: удаление ИМИТИРУЕМ (только лог).
+  SEND_TO_TAG  — 1: реально шлём ЛС в Tag; 0: заглушка в лог.
+  SEND_TO_MAIL — 1: дублируем уведомление на корпоративную почту; 0: не шлём.
+«Сухой прогон» = все три флага в 0. Рабочие окна (TIME_*_ASR / TIME_*_LLM) ОБЯЗАТЕЛЬНЫ —
+без них демон не стартует.
 """
 
 import os
@@ -42,23 +42,24 @@ class MMCfg:
 
 @dataclass
 class Cfg:
-    mode: str               # "test" | "prod"
     out_dir: str            # куда складывать папки записей (Transcripts/)
     db_path: str            # SQLite-файл витрины записей
     language: str           # язык распознавания
     delete_video_age_days: int  # видео старше N дней -> уведомить и удалить (по ТЗ — год)
-    text_retention_days: int    # сколько хранить тексты после удаления видео (5 лет)
+    text_retention_days: int    # сколько хранить тексты после удаления видео; None -> НЕ удалять
     min_duration: int           # короче N секунд -> не транскрибируем, удаляем при подхвате
+    asr_max_attempts: int       # после N неудач транскрибации -> терминальный ASR_FAILED
     emergency_hours: int        # если обработка «залипла» дольше N часов -> алерт админам
-    cycle_sec: float        # период «тика» в test-режиме (секунды)
-    run_at: tuple           # prod: время суточного запуска (час, минута)
+    shrink_warn_pct: int        # LLM-версия короче ASR более чем на N% -> баннер в _LLM.md
     delete_delay_sec: int   # через сколько после рассылки удалять видео
-    simulate_delete: bool   # true (test) -> удаление только логируем, файл не трогаем
+    real_delete: bool       # REAL_DELETE=1 -> реально удалять видео; 0 -> имитация (лог)
+    simulate_delete: bool   # = not real_delete (удаление только логируем, файл не трогаем)
     force_delete: bool      # удалять даже защищённые Толком (immutable)
     send_to_tag: bool       # реально слать ЛС в Tag (иначе notify — только лог)
+    send_to_mail: bool      # дублировать уведомление участнику на корпоративную почту (SMTP)
     admin_username: str     # bootstrap-админ (заносится в таблицу admins при старте)
-    asr_window: tuple       # окно транскрибации ((ч,м),(ч,м)) или None — работать всегда
-    llm_window: tuple       # окно LLM-обработки (improve/summarize/…) или None
+    asr_window: tuple       # окно транскрибации ((ч,м),(ч,м)) — ОБЯЗАТЕЛЬНО
+    llm_window: tuple       # окно LLM-обработки (improve/summarize/…) — ОБЯЗАТЕЛЬНО
     record_workers: int     # сколько записей обрабатывать параллельно (воркеров)
     mm: MMCfg = field(default_factory=MMCfg)
 
@@ -74,15 +75,6 @@ def _load_mm(env):
         button_secret=env.get("BUTTON_SECRET", ""),
         verify=env_flag(env, "MM_VERIFY_SSL", "1"),
     )
-
-
-def _parse_run_at(s):
-    """'HH:MM' -> (час, минута). По умолчанию 00:01."""
-    try:
-        hh, mm = (s or "00:01").split(":")
-        return int(hh), int(mm)
-    except (ValueError, AttributeError):
-        return 0, 1
 
 
 def _parse_hhmm(s):
@@ -132,41 +124,66 @@ def _window(env, prefix, fb_start, fb_end):
     return (s, e) if (s and e) else None
 
 
+def _int(env, key, default):
+    """Числовая переменная из env с устойчивостью к пустому/кривому значению -> default
+    (без падения на старте с трейсбеком int('') )."""
+    try:
+        return int((env.get(key) or "").strip() or default)
+    except (ValueError, TypeError):
+        return int(default)
+
+
 def load_cfg():
     env = load_env()
     require_env(env, "TALK_BASE_URL", "TALK_API_TOKEN",
                 "MAGNITGPT_API_KEY", "MAGNITGPT_BASE_URL", "MAGNITGPT_MODEL")
 
-    mode = (env.get("MODE", "test") or "test").strip().lower()
-    is_test = mode != "prod"
+    # REAL_DELETE=1 -> реально удаляем видео из Talk; 0 -> имитация (только лог).
+    real_delete = env_flag(env, "REAL_DELETE", "0")
 
-    default_delay = _TEST_DELETE_DELAY_SEC if is_test else _PROD_DELETE_DELAY_SEC
-    delete_delay_sec = int(env.get("DELETE_DELAY_SEC", str(default_delay)))
+    default_delay = _PROD_DELETE_DELAY_SEC if real_delete else _TEST_DELETE_DELAY_SEC
+    # DELETE_AFTER_NOTIFICATION (в секундах) — через сколько после ЛС удалять видео.
+    # Фоллбэк на старое имя DELETE_DELAY_SEC; пусто/не задано -> дефолт (real=неделя / имит.=3мин).
+    _delay = (env.get("DELETE_AFTER_NOTIFICATION") or env.get("DELETE_DELAY_SEC") or "").strip()
+    delete_delay_sec = int(_delay) if _delay else default_delay
+
+    # TEXT_RETENTION_DAYS не задан (пусто) -> тексты НЕ удаляются никогда (None).
+    _retention = (env.get("TEXT_RETENTION_DAYS") or "").strip()
+    text_retention_days = int(_retention) if _retention else None
+
+    # Рабочие окна ОБЯЗАТЕЛЬНЫ. Фоллбэк — общие TIME_START/END. Если ни специфичные,
+    # ни общие не заданы -> окно = None, и демон не стартует (fail-fast ниже).
+    asr_window = _window(env, "ASR", _parse_hhmm(env.get("TIME_START", "")),
+                         _parse_hhmm(env.get("TIME_END", "")))
+    llm_window = _window(env, "LLM", _parse_hhmm(env.get("TIME_START", "")),
+                         _parse_hhmm(env.get("TIME_END", "")))
+    missing = [n for n, w in (("ASR", asr_window), ("LLM", llm_window)) if not w]
+    if missing:
+        raise SystemExit(
+            "[!] Не заданы рабочие окна: " + ", ".join(missing) + ". Демон работает ТОЛЬКО "
+            "по временным окнам — задай TIME_START_ASR/TIME_END_ASR и TIME_START_LLM/"
+            "TIME_END_LLM (или общие TIME_START/TIME_END) в .env и повтори.")
 
     return Cfg(
-        mode="test" if is_test else "prod",
         out_dir=os.path.join(HERE, "Transcripts"),
         db_path=env.get("DB_PATH") or os.path.join(HERE, "data", "recordings.db"),
         language=env.get("ASR_LANGUAGE", "ru"),
-        delete_video_age_days=int(env.get("DELETE_VIDEO_AGE_DAYS", "365")),
-        text_retention_days=int(env.get("TEXT_RETENTION_DAYS", str(5 * 365))),
-        min_duration=int(env.get("MIN_DURATION", "60")),
-        emergency_hours=int(env.get("EMERGENCY", "24")),
-        cycle_sec=float(env.get("TEST_CYCLE_SEC", "60")),
-        run_at=_parse_run_at(env.get("RUN_AT", "00:01")),
+        delete_video_age_days=_int(env, "DELETE_VIDEO_AGE_DAYS", 365),
+        text_retention_days=text_retention_days,
+        min_duration=_int(env, "MIN_DURATION", 60),
+        asr_max_attempts=max(1, _int(env, "ASR_MAX_ATTEMPTS", 5)),
+        emergency_hours=_int(env, "EMERGENCY", 24),
+        shrink_warn_pct=_int(env, "LLM_SHRINK_WARN_PCT", 5),
         delete_delay_sec=delete_delay_sec,
-        simulate_delete=is_test,
+        real_delete=real_delete,
+        simulate_delete=not real_delete,
         force_delete=env_flag(env, "FORCE_DELETE", "0"),
-        # Безопасный выключатель: 0 — рассылка в Tag только логируется (заглушка).
+        # Каналы уведомления: реальная рассылка в Tag / на почту (иначе — заглушка в лог).
         send_to_tag=env_flag(env, "SEND_TO_TAG", "0"),
+        send_to_mail=env_flag(env, "SEND_TO_MAIL", "0"),
         admin_username=env.get("ADMIN_USERNAME", "").strip(),
-        # Раздельные окна: транскрибация (ASR) — обычно шире, LLM-обработка — уже.
-        # TIME_START_ASR/END_ASR и TIME_START_LLM/END_LLM; фоллбэк — общие TIME_START/END.
-        # Работают в ОБОИХ режимах (test и prod). Все пустые -> работать всегда (без окон).
-        asr_window=_window(env, "ASR", _parse_hhmm(env.get("TIME_START", "")),
-                           _parse_hhmm(env.get("TIME_END", ""))),
-        llm_window=_window(env, "LLM", _parse_hhmm(env.get("TIME_START", "")),
-                           _parse_hhmm(env.get("TIME_END", ""))),
-        record_workers=max(1, int(env.get("RECORD_WORKERS", "4"))),
+        asr_window=asr_window,
+        llm_window=llm_window,
+        record_workers=max(1, _int(env, "RECORD_WORKERS", 4)),
         mm=_load_mm(env),
     )

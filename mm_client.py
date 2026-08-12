@@ -18,18 +18,8 @@ import os
 import requests
 import urllib3
 
-# Тексты/лейблы кнопок — в одном месте, чтобы демон и бот их не рассинхронизировали.
-BTN_VIDEO = "Видеозапись"
-BTN_FULL = "Вся расшифровка"
-BTN_SHORT = "Короткая выжимка"
-BTN_FIND = "Найти видеозапись"
-
-# Варианты действия в модалке «Найти видеозапись» (value -> подпись).
-FIND_ACTIONS = [
-    ("full", "скачать текстовую расшифровку"),
-    ("short", "скачать краткую выжимку"),
-    ("video", "Скачать видеозапись конференции"),
-]
+# Лейблы кнопок и варианты скачивания — в texts.py (единый источник строк).
+from texts import BTN_FIND, BTN_DOWNLOAD, FILE_ACTIONS
 
 
 class MMClient:
@@ -101,8 +91,12 @@ class MMClient:
 
     def post_file(self, channel_id, file_path, message="", root_id=None):
         """Отправить файл В ВЕТКУ (root_id) с опциональным текстом."""
-        file_id = self.upload_file(channel_id, file_path)
-        payload = {"channel_id": channel_id, "message": message, "file_ids": [file_id]}
+        return self.post_files(channel_id, [file_path], message=message, root_id=root_id)
+
+    def post_files(self, channel_id, file_paths, message="", root_id=None):
+        """Отправить НЕСКОЛЬКО файлов одним постом В ВЕТКУ (для действия «Всё»)."""
+        file_ids = [self.upload_file(channel_id, p) for p in file_paths]
+        payload = {"channel_id": channel_id, "message": message, "file_ids": file_ids}
         if root_id:
             payload["root_id"] = root_id
         return self._post("/posts", payload)
@@ -128,20 +122,24 @@ class MMClient:
                 "integration": {"url": self.action_url(), "context": context}}
 
     def archive_attachment(self, text, recording_key):
-        """Вложение уведомления об архивации: текст + 3 кнопки."""
+        """Вложение per-record уведомления: текст + кнопки скачивания текста
+        (Базовая/Улучшенная расшифровка, Краткая выжимка, Всё). Видео — из Talk напрямую."""
         return [{
             "text": text,
-            "actions": [
-                self._action("video", BTN_VIDEO, {"action": "video", "key": recording_key}),
-                self._action("full", BTN_FULL, {"action": "full", "key": recording_key}),
-                self._action("short", BTN_SHORT, {"action": "short", "key": recording_key}),
-            ],
+            "actions": [self._action(val, label, {"action": val, "key": recording_key})
+                        for val, label in FILE_ACTIONS],
         }]
 
     def help_attachment(self, text):
-        """Вложение help-сообщения: текст + кнопка «Найти видеозапись»."""
+        """Вложение help-сообщения: текст + кнопка «Найти видеозапись» (открывает модалку)."""
         return [{"text": text,
                  "actions": [self._action("find", BTN_FIND, {"action": "find"})]}]
+
+    def old_records_attachment(self, text):
+        """Вложение единоразового old-records уведомления: текст + кнопка «Скачать запись».
+        Кнопка открывает ТУ ЖЕ модалку выбора записи/типа, что и «Найти видеозапись»."""
+        return [{"text": text,
+                 "actions": [self._action("find", BTN_DOWNLOAD, {"action": "find"})]}]
 
     def send_archive_dm(self, username, text, recording_key):
         """
@@ -152,6 +150,13 @@ class MMClient:
         channel_id = self.direct_channel(user["id"])
         return self.post(channel_id, message="",
                          props={"attachments": self.archive_attachment(text, recording_key)})
+
+    def send_old_records_dm(self, username, text):
+        """Единоразовое old-records ЛС: текст + кнопка «Скачать запись» (открывает модалку)."""
+        user = self.user_by_username(username)
+        channel_id = self.direct_channel(user["id"])
+        return self.post(channel_id, message="",
+                         props={"attachments": self.old_records_attachment(text)})
 
     def send_dm(self, username, text):
         """Простое ЛС пользователю (без кнопок) — например, алерт админу."""

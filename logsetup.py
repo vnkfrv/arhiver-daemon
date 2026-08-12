@@ -17,6 +17,14 @@ logsetup.py — единая настройка логов демона.
 import logging
 import os
 import threading
+from logging.handlers import RotatingFileHandler
+
+# Лимиты ротации: файл не растёт больше _MAX_BYTES, храним _BACKUPS прошлых кусков.
+# Без ротации на «горе» (десятки тысяч записей) логи забьют диск.
+_MAX_BYTES = 50 * 1024 * 1024        # 50 МБ на файл
+_BACKUPS = 5                          # daemon.log.1 … .5
+_WORKER_MAX_BYTES = 20 * 1024 * 1024  # 20 МБ на лог воркера
+_WORKER_BACKUPS = 3
 
 _ctx = threading.local()
 
@@ -37,28 +45,29 @@ class _RecordFilter(logging.Filter):
 
 
 class PerWorkerFileHandler(logging.Handler):
-    """Пишет лог каждого потока в отдельный файл logs/<threadName>.log."""
+    """Пишет лог каждого потока в отдельный файл logs/<threadName>.log. Внутри — по
+    RotatingFileHandler на поток (лимит размера + backupCount), чтобы файлы не росли вечно."""
     def __init__(self, log_dir, formatter):
         super().__init__()
         self.log_dir = log_dir
         self.setFormatter(formatter)
-        self._streams = {}
+        self._handlers = {}
         self._lock = threading.Lock()
 
-    def _stream(self, name):
-        s = self._streams.get(name)
-        if s is None:
-            s = open(os.path.join(self.log_dir, f"{name}.log"), "a", encoding="utf-8")
-            self._streams[name] = s
-        return s
+    def _handler(self, name):
+        h = self._handlers.get(name)
+        if h is None:
+            h = RotatingFileHandler(os.path.join(self.log_dir, f"{name}.log"),
+                                    maxBytes=_WORKER_MAX_BYTES, backupCount=_WORKER_BACKUPS,
+                                    encoding="utf-8")
+            h.setFormatter(self.formatter)
+            self._handlers[name] = h
+        return h
 
     def emit(self, record):
         try:
-            msg = self.format(record)
             with self._lock:
-                s = self._stream(record.threadName)
-                s.write(msg + "\n")
-                s.flush()
+                self._handler(record.threadName).emit(record)   # ротацию делает RotatingFileHandler
         except Exception:
             self.handleError(record)
 
@@ -79,7 +88,8 @@ def setup(log_dir, per_worker=True, level=logging.INFO):
     console.addFilter(filt)
     root.addHandler(console)
 
-    daemon = logging.FileHandler(os.path.join(log_dir, "daemon.log"), encoding="utf-8")
+    daemon = RotatingFileHandler(os.path.join(log_dir, "daemon.log"),
+                                 maxBytes=_MAX_BYTES, backupCount=_BACKUPS, encoding="utf-8")
     daemon.setFormatter(fmt)
     daemon.addFilter(filt)
     root.addHandler(daemon)

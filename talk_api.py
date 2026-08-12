@@ -29,16 +29,20 @@ _KNOWN_KEYS = (
     "TALK_BASE_URL", "TALK_API_TOKEN", "TALK_VERIFY_SSL",
     "MAGNITGPT_API_KEY", "MAGNITGPT_BASE_URL", "MAGNITGPT_MODEL", "MAGNITGPT_VERIFY_SSL",
     "MAGNITGPT_LLM_API_KEY", "MAGNITGPT_LLM_MODEL", "MAGNITGPT_LLM_BASE_URL", "LLM_THINKING",
-    "ASR_CHUNK_SEC", "LLM_MAX_CHARS",
-    # режимы/демон/БД
-    "MODE", "TEST_CYCLE_SEC", "RUN_AT", "TIME_START", "TIME_END",
+    "ASR_CHUNK_SEC", "LLM_MAX_CHARS", "LLM_MAX_TOKENS", "LLM_TEMPERATURE", "LLM_SHRINK_WARN_PCT",
+    # флаги/демон/БД
+    "REAL_DELETE", "TIME_START", "TIME_END",
     "TIME_START_ASR", "TIME_END_ASR", "TIME_START_LLM", "TIME_END_LLM",
-    "RECORD_WORKERS", "DELETE_DELAY_SEC",
-    "DELETE_VIDEO_AGE_DAYS", "TEXT_RETENTION_DAYS", "MIN_DURATION", "ASR_LANGUAGE", "FORCE_DELETE",
+    "RECORD_WORKERS", "DELETE_DELAY_SEC", "DELETE_AFTER_NOTIFICATION",
+    "DELETE_VIDEO_AGE_DAYS", "TEXT_RETENTION_DAYS", "MIN_DURATION", "ASR_MAX_ATTEMPTS",
+    "ASR_LANGUAGE", "FORCE_DELETE",
     "DB_PATH", "ADMIN_USERNAME", "ASR_LLM_RPM", "EMERGENCY",
     # Tag/Mattermost
     "URL", "SCHEME", "PORT", "MM_VERIFY_SSL", "BOT_TOKEN",
     "BOT_PUBLIC_URL", "BUTTON_PORT", "BUTTON_SECRET", "SEND_TO_TAG",
+    # Почта (SMTP)
+    "SEND_TO_MAIL", "SMTP_SERVER", "SMTP_PORT", "SMTP_SECURITY",
+    "SMTP_SENDER", "SMTP_LOGIN", "SMTP_PASSWORD",
 )
 
 
@@ -205,14 +209,16 @@ class TalkClient:
             ui = p.get("userInfo") or {}
             login = ui.get("login")
             name = " ".join(x for x in (ui.get("firstname"), ui.get("surname")) if x).strip()
-            email = None
+            email, disabled = None, False
             if login:
                 try:
-                    email = self.user_info(login).get("email")
+                    info = self.user_info(login)    # один запрос: и email, и статus disabled
+                    email = info.get("email")
+                    disabled = bool(info.get("disabled"))
                 except Exception:
                     email = None                    # недоступен профиль — оставим None
             out.append({"name": name or (p.get("anonymousName") or "?"),
-                        "email": email, "login": login})
+                        "email": email, "login": login, "disabled": disabled})
         return out
 
     def download_video(self, key, dest_path):

@@ -14,4 +14,7 @@ state.json
 *.mp4
 *.zip
 TestRecord/
+stuff/
+logggs.txt
+.DS_Store
 .git/

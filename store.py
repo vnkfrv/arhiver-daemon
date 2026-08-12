@@ -4,28 +4,22 @@ store.py — ФАЙЛОВОЕ ХРАНИЛИЩЕ выходных файлов �
 Раскладка ШАРДИРОВАНА по дате записи, чтобы в одной директории не копились сотни
 тысяч подпапок:
     Transcripts/<ГГГГ>/<ММ>/<ID>/
-        <ID>_full.md          # шапка (Название/Дата/Длительность/Участники) + расшифровка
+        <ID>_ASR.md           # ДОСЛОВНЫЙ ASR (истина; LLM его НЕ перезаписывает)
+        <ID>_LLM.md           # LLM-обработанная расшифровка (чистка терминологии/вид стенограммы)
         <ID>_short.md         # короткая выжимка (LLM)
+Шапка (Название/Дата/Длительность/Участники) добавляется в начало _ASR.md и _LLM.md.
 
 Папка записи (rec_dir) вычисляется из даты + ключа (store.rec_dir) и хранится в БД
 (recordings.rec_dir). Промежуточных файлов нет — вся память пайплайна в БД, на диске
-только два итоговых .md.
+только итоговые .md. Дословный _ASR.md отделён от _LLM.md специально: любая LLM-правка
+может потерять/исказить текст, поэтому оригинал распознавания хранится нетронутым.
 """
 
 import os
 import shutil
-from datetime import datetime
 
 from talk_api import hhmmss
-
-
-def _parse_dt(s):
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except ValueError:
-        return None
+from util import parse_dt as _parse_dt
 
 
 def rec_dir(base, key, created_date):
@@ -36,12 +30,22 @@ def rec_dir(base, key, created_date):
     return os.path.join(base, sub, key)
 
 
-def full_path(rd, key):
-    return os.path.join(rd, f"{key}_full.md")
+def asr_path(rd, key):
+    return os.path.join(rd, f"{key}_ASR.md")
+
+
+def llm_path(rd, key):
+    return os.path.join(rd, f"{key}_LLM.md")
 
 
 def short_path(rd, key):
     return os.path.join(rd, f"{key}_short.md")
+
+
+def _old_full_path(rd, key):
+    # Старое единое имя <ID>_full.md (до разделения на _ASR/_LLM). Оставлено для
+    # обратной совместимости: записи, обработанные ДО перехода, читаются отсюда.
+    return os.path.join(rd, f"{key}_full.md")
 
 
 def blocks_to_md(blocks):
@@ -51,41 +55,67 @@ def blocks_to_md(blocks):
 
 
 def write_transcript(rd, key, blocks):
-    """Записать сырую расшифровку в <ID>_full.md (пока БЕЗ шапки и LLM-правок —
-    стадия improve перезапишет тело, стадия save_to_db добавит шапку)."""
-    write_full_md(rd, key, blocks_to_md(blocks))
+    """Записать ДОСЛОВНУЮ ASR-расшифровку в <ID>_ASR.md (пока БЕЗ шапки; шапку добавит
+    save_to_db). Этот файл LLM НЕ перезаписывает — он остаётся истиной распознавания."""
+    write_asr_md(rd, key, blocks_to_md(blocks))
 
 
 HEADER_PREFIX = "Название:"
+WARN_PREFIX = "⚠️"
 
 
 def strip_header(md):
-    """Убрать ведущую шапку (Название/…/Участники) из <ID>_full.md, если она есть —
-    чтобы повторная запись шапки не задваивалась. Шапка = блок до первой пустой строки."""
-    if md.lstrip().startswith(HEADER_PREFIX):
-        parts = md.split("\n\n", 1)
+    """Убрать ведущий баннер-предупреждение (если есть) И шапку (Название/…/Участники),
+    чтобы повторная запись не задваивала их. Каждый блок = до первой пустой строки."""
+    t = md.lstrip()
+    if t.startswith(WARN_PREFIX):                 # сначала снять баннер усушки
+        parts = t.split("\n\n", 1)
+        t = (parts[1] if len(parts) == 2 else "").lstrip()
+    if t.startswith(HEADER_PREFIX):               # затем снять шапку
+        parts = t.split("\n\n", 1)
         return parts[1] if len(parts) == 2 else ""
-    return md
+    return t
 
 
-def write_full_md(rd, key, md):
-    """Записать/перезаписать <ID>_full.md (полная расшифровка)."""
-    os.makedirs(rd, exist_ok=True)
-    with open(full_path(rd, key), "w") as f:
+def _write(path, md):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         f.write(md.rstrip() + "\n")
+
+
+def _read(path):
+    return open(path).read() if os.path.exists(path) else None
+
+
+def write_asr_md(rd, key, md):
+    """Записать/перезаписать <ID>_ASR.md (дословный ASR + шапка на стадии save_to_db)."""
+    _write(asr_path(rd, key), md)
+
+
+def write_llm_md(rd, key, md):
+    """Записать/перезаписать <ID>_LLM.md (LLM-обработанная расшифровка)."""
+    _write(llm_path(rd, key), md)
 
 
 def write_short_md(rd, key, md):
     """Записать <ID>_short.md — короткую выжимку LLM."""
-    os.makedirs(rd, exist_ok=True)
-    with open(short_path(rd, key), "w") as f:
-        f.write(md.rstrip() + "\n")
+    _write(short_path(rd, key), md)
 
 
-def read_full_md(rd, key):
-    """Прочитать текущий <ID>_full.md (вход для стадий improve/summarize)."""
-    p = full_path(rd, key)
-    return open(p).read() if os.path.exists(p) else None
+def read_asr_md(rd, key):
+    """Дословный ASR (<ID>_ASR.md); вход для стадии improve. Fallback на старый
+    <ID>_full.md — чтобы записи, транскрибированные ДО перехода, не потеряли текст."""
+    return _read(asr_path(rd, key)) or _read(_old_full_path(rd, key))
+
+
+def read_llm_md(rd, key):
+    """LLM-обработанная расшифровка (<ID>_LLM.md); вход для стадии summarize."""
+    return _read(llm_path(rd, key))
+
+
+def read_short_md(rd, key):
+    """Короткая выжимка (<ID>_short.md) — чтобы добавить в неё шапку на стадии save."""
+    return _read(short_path(rd, key))
 
 
 def remove_record_dir(rd):
