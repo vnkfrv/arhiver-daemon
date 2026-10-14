@@ -3,12 +3,22 @@
 #   talk-bot    — интерактивный бот Tag (кнопки/модалка/выдача файлов, алерты админам).
 # Общие тома: data (SQLite-БД), Transcripts (файлы расшифровок), logs.
 # Первый прогон — с SEND_TO_TAG=0 в .env (наполнить архивы, никому не слать).
+
+# Вывод контейнеров (docker logs) Docker по умолчанию копит без ограничений, а оба сервиса пишут
+# туда всё, что и в logs/. Ограничиваем: не больше 3 файлов по 50 МБ на сервис.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   talk-daemon:
     build: .
     image: talk-archiver-nikiforov:latest
     container_name: talk-daemon-nikiforov
     restart: unless-stopped
+    logging: *logging
     env_file:
       - .env
     command: python main.py
@@ -21,13 +31,15 @@ services:
     image: talk-archiver-nikiforov:latest   # тот же образ, что собрал talk-daemon
     container_name: talk-bot-nikiforov
     restart: unless-stopped
+    logging: *logging
     env_file:
       - .env
     command: python bot.py
     depends_on:
       - talk-daemon
-    # /health отвечает всегда, пока бот жив -> restart реагирует на «зависание», не только
-    # на падение процесса. (Демону healthcheck не ставим: в простое между окнами он молчит.)
+    # /health отвечает, пока жив HTTP-сервер бота. Зависший бот получит статус unhealthy в
+    # `docker compose ps`, но сам Docker такой контейнер НЕ перезапускает — restart срабатывает
+    # только при выходе процесса. (Демону healthcheck не ставим: в простое между окнами он молчит.)
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('BUTTON_PORT','8081')+'/health', timeout=5)"]

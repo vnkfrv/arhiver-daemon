@@ -4,7 +4,12 @@
 Общие тома: `data/` (SQLite-БД), `Transcripts/` (расшифровки), `logs/`.
 
 ## Предусловия на хосте
-- Docker + Docker Compose (`docker compose version`).
+- Docker + Docker Compose v2 (`docker compose version`). На **Debian 13** хватит пакетов
+  дистрибутива: `sudo apt install docker.io docker-compose` (Engine 26.1 и Compose 2.26 — он же
+  работает как `docker compose`); подойдёт и Docker CE из репозитория Docker. Своего
+  пользователя — в группу `docker`: `sudo usermod -aG docker $USER` и перелогиниться.
+- Docker должен суметь скачать базовый образ `python:3.11-slim-trixie`: Docker Hub открыт либо
+  в `/etc/docker/daemon.json` задано корпоративное зеркало реестра (`registry-mirrors`).
 - Хост в корп-сети — шлюз `llmlite…` (ASR/LLM) и `talk.magnit.ru` доступны **без VPN**.
 - Заполненный `.env` (секреты; в git НЕ коммитим).
 
@@ -20,14 +25,14 @@ git push origin <ветка>
 # на хосте:
 ssh <user>@<host>
 git clone <repo-url> talk-archiver      # или: cd talk-archiver && git pull
-cd talk-archiver/05_step_1
+cd talk-archiver                        # корень репозитория — это и есть папка проекта
 ```
 
 **Вариант Б — напрямую rsync (без репо):**
 ```bash
 rsync -av --exclude .venv --exclude __pycache__ --exclude Transcripts --exclude data \
       --exclude logs --exclude '*.db*' --exclude '*.mp4' --exclude .env --exclude .git \
-      ./ <user>@<host>:~/talk-archiver/05_step_1/
+      ./ <user>@<host>:~/talk-archiver/
 ```
 
 ## Шаг 2. `.env` на хосте
@@ -36,23 +41,29 @@ cp .env.example .env
 nano .env    # заполнить реальными значениями
 ```
 Обязательно: `TALK_BASE_URL`/`TALK_API_TOKEN`; `MAGNITGPT_*` (ASR) и `MAGNITGPT_LLM_*` (LLM);
-`MODE=prod`; окна `TIME_START_ASR/END_ASR`, `TIME_START_LLM/END_LLM`; `RECORD_WORKERS`;
+флаги `REAL_DELETE`/`SEND_TO_TAG`/`SEND_TO_MAIL`; окна `TIME_START_ASR/END_ASR`, `TIME_START_LLM/END_LLM`;
+`TZ` (если окна — по Москве); `RECORD_WORKERS`;
 `MIN_DURATION`; Tag-блок (`URL`/`PORT`/`BOT_TOKEN`/`BOT_PUBLIC_URL`/`BUTTON_PORT`/
 `BUTTON_SECRET`); `ADMIN_USERNAME`.
-**На первый прогон — `SEND_TO_TAG=0`** (наполнить архивы, никому не слать).
+**На первый прогон — `REAL_DELETE=0`, `SEND_TO_TAG=0`, `SEND_TO_MAIL=0`** (наполнить архивы,
+никому не слать, ничего не удалять).
 
 **Два бота в Tag.** Нужны две учётки-бота: основная (`BOT_TOKEN`) и админская (`ADMIN_BOT_TOKEN`).
 Вторую заводят так же, как первую (в Tag: «Интеграции» → «Аккаунты ботов»), её токен кладут в
 `ADMIN_BOT_TOKEN`. Отдельный порт и сервис не нужны: обоих ботов обслуживает `talk-bot`, кнопки
 обоих ведут на тот же `BOT_PUBLIC_URL`.
 
-Если `.env` остался от прежней версии: `ASR_MAX_ATTEMPTS` и `EMERGENCY` больше не используются
-(вместо них — лестница `RETRY_DELAYS_MIN` и суточная сводка админам `ADMIN_REPORT_TIME`), их можно
-удалить.
+Если `.env` остался от прежней версии: `MODE`, `ASR_MAX_ATTEMPTS` и `EMERGENCY` больше не
+используются (вместо них — флаги выше, лестница `RETRY_DELAYS_MIN` и суточная сводка админам
+`ADMIN_REPORT_TIME`), их можно удалить. Каких ключей из `.env.example` в твоём `.env` нет — покажет
+(только имена, без значений):
+```bash
+comm -13 <(grep -oE '^[A-Z_]+=' .env | sort -u) <(grep -oE '^[A-Z_]+=' .env.example | sort -u)
+```
 
 ## Шаг 3. Сборка и запуск
 ```bash
-cd 05_step_1
+cd ~/talk-archiver
 docker compose build      # образ; pip из корп-зеркала repo.corp.tander.ru
 docker compose up -d       # поднять оба сервиса
 ```
@@ -73,6 +84,8 @@ git pull                  # или повторить rsync
 docker compose build
 docker compose up -d       # пересоздаст контейнеры новым образом (тома/БД сохранятся)
 ```
+После правки одного лишь `.env` (без нового кода) контейнеры пересоздай явно:
+`docker compose up -d --force-recreate` — переменные из `.env` читаются только при создании контейнера.
 
 ## Управление
 ```bash
@@ -100,7 +113,14 @@ docker compose exec talk-daemon python main.py --once   # разовый про�
   Tag, сколько записей за сутки встало в ожидание админа (статусы `FAILED_…`) и на каких стадиях;
   если таких нет — молчит. Нужны `ADMIN_USERNAME` и Tag-блок в `.env`; уходит даже при `SEND_TO_TAG=0`. Кнопки в
   сводке обрабатывает `talk-bot`.
-- **Часовой пояс:** рабочие окна и время сводки считаются по часам контейнера. В `docker-compose.yml`
-  пояс не задан — значит, это UTC (9:00 = 12:00 по Москве). Нужен другой — задай `TZ` в `.env`
-  (например `TZ=Europe/Moscow`); учти, что вместе со сводкой сдвинутся и окна.
+- **Часовой пояс:** рабочие окна и время сводки считаются по часам контейнера, а контейнер пояс
+  у ВМ НЕ берёт: пока `TZ` не задан, это UTC (9:00 = 12:00 по Москве), как бы ни была настроена
+  сама ВМ. Окна задуманы по Москве — добавь в `.env` строку `TZ=Europe/Moscow` (база часовых
+  поясов в образе есть) и пересоздай контейнеры: `docker compose up -d`.
+- **Логи Docker** (`docker compose logs`) ротируются: не больше 3 файлов по 50 МБ на сервис
+  (`x-logging` в `docker-compose.yml`). Полные логи — в `logs/` (своя ротация).
+- **Порт бота и файрвол.** Опубликованный порт Docker открывает в обход nftables/ufw на ВМ.
+  Бот защищён секретом в URL и подписями кнопок; чтобы порт не слушал все интерфейсы, укажи
+  адрес: `"10.0.0.5:${BOT_HOST_PORT:-8081}:${BUTTON_PORT:-8081}"` (адрес ВМ, до которого
+  достучится Tag).
 - **Админ-панель:** команда `archiever_admin` в ЛС боту (см. README).

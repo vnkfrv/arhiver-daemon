@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# Python 3.11 на Debian 13 (trixie). Сейчас это и есть python:3.11-slim, но явный суффикс не даст
+# образу молча «переехать» на следующий Debian при очередной пересборке. В образе уже есть tzdata
+# (TZ из .env работает), ca-certificates и LANG=C.UTF-8.
+FROM python:3.11-slim-trixie
 
 # логи Python не буферизуются -> видны в docker logs сразу
 ENV PYTHONUNBUFFERED=1
