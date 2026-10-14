@@ -56,21 +56,28 @@ def main():
     print("=" * 52)
 
     # --- записи по состояниям ---
-    r = _one(conn, """
-        SELECT
-          COUNT(*)                                           total,
-          COALESCE(SUM(saved_to_db=1), 0)                    saved,
-          COALESCE(SUM(transcribed=1), 0)                    transcribed,
-          COALESCE(SUM(status=?), 0)                         asr_failed,
-          COALESCE(SUM(no_audio=1), 0)                       no_audio,
-          COALESCE(SUM(deleted=1), 0)                        deleted,
-          COALESCE(SUM(delete_simulated=1 AND deleted=0), 0) delete_sim,
-          COALESCE(SUM(protected=1), 0)                      protected,
-          COALESCE(SUM(text_cleaned=1), 0)                   text_cleaned,
-          COALESCE(SUM(messages_sent=1), 0)                  messaged,
-          COALESCE(SUM(saved_to_db=0 AND no_audio=0 AND done=0 AND status!=?), 0) pending
-        FROM recordings
-    """, (statuses.ASR_FAILED, statuses.ASR_FAILED))
+    try:
+        r = _one(conn, """
+            SELECT
+              COUNT(*)                                           total,
+              COALESCE(SUM(saved_to_db=1), 0)                    saved,
+              COALESCE(SUM(transcribed=1), 0)                    transcribed,
+              COALESCE(SUM(needs_admin=1), 0)                    hold,
+              COALESCE(SUM(fail_count>0 AND needs_admin=0 AND done=0), 0) retrying,
+              COALESCE(SUM(no_audio=1), 0)                       no_audio,
+              COALESCE(SUM(no_channels=1), 0)                    no_channels,
+              COALESCE(SUM(deleted=1), 0)                        deleted,
+              COALESCE(SUM(delete_simulated=1 AND deleted=0), 0) delete_sim,
+              COALESCE(SUM(protected=1), 0)                      protected,
+              COALESCE(SUM(kept_forever=1), 0)                   kept_forever,
+              COALESCE(SUM(text_cleaned=1), 0)                   text_cleaned,
+              COALESCE(SUM(messages_sent=1), 0)                  messaged,
+              COALESCE(SUM(saved_to_db=0 AND no_audio=0 AND done=0 AND needs_admin=0), 0) pending
+            FROM recordings
+        """)
+    except sqlite3.OperationalError as ex:
+        raise SystemExit(f"[!] БД старой версии ({ex}).\n    Запусти демон или бота новой версии — "
+                         "схема обновится автоматически, затем повтори.")
 
     total = r["total"]
     print("ЗАПИСИ")
@@ -78,15 +85,24 @@ def main():
     print(f"  готово (в архиве):     {r['saved']}")
     print(f"  транскрибировано:      {r['transcribed']}")
     print(f"  ждут обработки:        {r['pending']}")
+    print(f"  повторяются после сбоя:{r['retrying']}")
+    print(f"  ждут админа (FAILED_…):{r['hold']}" + ("   <- нужна команда restart_passed" if r["hold"] else ""))
     print(f"  уведомлены участники:  {r['messaged']}")
-    print(f"  битый звук (no_audio): {r['no_audio']}")
-    print(f"  ASR_FAILED (лимит):    {r['asr_failed']}")
+    print(f"  без аудио (no_audio):  {r['no_audio']}")
+    print(f"  без дорожек спикеров:  {r['no_channels']}")
     print(f"  защищено (remember):   {r['protected']}")
+    print(f"  DELETE_PROTECTION:     {r['kept_forever']}   (Толк запрещает удалять)")
     print(f"  удалено видео:         {r['deleted']}   (имитация: {r['delete_sim']})")
     print(f"  тексты очищены (5 лет):{r['text_cleaned']}")
     if total:
-        bad = r["no_audio"] + r["asr_failed"]
-        print(f"  доля непригодных:      {100 * bad / total:.1f}%  (битый звук + ASR_FAILED)")
+        bad = r["no_audio"] + r["hold"]
+        print(f"  доля необработанных:   {100 * bad / total:.1f}%  (без аудио + ждут админа)")
+
+    hs = conn.execute("SELECT COALESCE(fail_stage, '?') s, COUNT(*) c, MAX(last_error) e "
+                      "FROM recordings WHERE needs_admin=1 GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    for h in hs:
+        print(f"    {statuses.failed(h['s'])} ({statuses.STAGE_NAMES.get(h['s'], h['s'])}): {h['c']}  "
+              f"(напр.: {str(h['e'] or '—')[:80]})")
 
     # --- фаза old-records (может не быть в старой БД) ---
     print("-" * 52)
@@ -104,18 +120,18 @@ def main():
     except sqlite3.OperationalError:
         print("  (таблицы users/meta ещё нет — демон не запускался на этой БД)")
 
-    # --- залипшие ошибки (риск EMERGENCY) ---
+    # --- записи, которые сейчас повторяются после сбоя ---
     print("-" * 52)
-    print("ОШИБКИ / ЗАЛИПАНИЕ")
+    print("ОШИБКИ / ПОВТОРЫ")
     oe = _one(conn, "SELECT MIN(error_since) m, COUNT(*) c FROM recordings "
                     "WHERE error_since IS NOT NULL AND done=0")
     if oe and oe["m"]:
         h = _hours_since(oe["m"])
         htxt = f"≈{h:.1f} ч назад" if h is not None else "?"
-        print(f"  записей с «залипшей» ошибкой: {oe['c']}")
-        print(f"  самая старая:                {str(oe['m'])[:19]} ({htxt})")
+        print(f"  записей в повторах после сбоя: {oe['c']}")
+        print(f"  самая давняя первая ошибка:   {str(oe['m'])[:19]} ({htxt})")
     else:
-        print("  залипших ошибок нет ✅")
+        print("  записей в повторах нет ✅")
 
     # --- активность (liveness): что-то обновлялось недавно ---
     # updated_at пишется нашим кодом в isoformat (+00:00) — сравнение однородное

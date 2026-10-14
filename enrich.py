@@ -11,7 +11,7 @@ import logging
 import re
 
 from llm import LLMTruncated
-from talk_api import load_env
+from talk_api import load_env, env_int
 
 log = logging.getLogger("enrich")
 
@@ -37,8 +37,14 @@ def _chat_split(llm, system, text):
     по строкам и обрабатываем половины отдельно, рекурсивно. Так длинный кусок гарантированно
     переписывается целиком и НИ ОДНА реплика не теряется (баг с обрывом «…То е>»)."""
     try:
-        return _unfence(llm.chat(system, text, temperature=_temperature(),
-                                 max_tokens=_max_tokens()))
+        out = _unfence(llm.chat(system, text, temperature=_temperature(),
+                                max_tokens=_max_tokens()))
+        # САМОПРОВЕРКА: на непустой вход модель обязана что-то вернуть. Пустой ответ (content
+        # пуст или null) — сбой, а не результат: иначе пустая «правка» ушла бы в файл как
+        # готовая, а выжимка по ней молча не была бы сделана.
+        if not out and text.strip():
+            raise RuntimeError("LLM вернул пустой ответ — результат не принят")
+        return out
     except LLMTruncated:
         lines = text.splitlines()
         if len(lines) <= 1:
@@ -142,7 +148,7 @@ def improve_transcript(text, llm):
     Короткий текст — один запрос. Длинный — по частям + объединение таблиц.
     Бросает исключение при сбое LLM (pipeline поймает и оставит improved=false).
     """
-    max_chars = int(load_env().get("LLM_MAX_CHARS", "30000"))
+    max_chars = env_int(load_env(), "LLM_MAX_CHARS", 30000, minimum=1)
     text = text.strip()
 
     if len(text) <= max_chars:
@@ -173,7 +179,7 @@ def summarize_text(full_md, llm):
     мини-резюме, затем резюме резюме. Бросает исключение при сбое LLM (pipeline
     поймает и оставит summarized=false -> повтор позже).
     """
-    max_chars = int(load_env().get("LLM_MAX_CHARS", "30000"))
+    max_chars = env_int(load_env(), "LLM_MAX_CHARS", 30000, minimum=1)
     text = full_md.strip()
     if len(text) <= max_chars:
         return _chat_split(llm, SUMMARY_SYSTEM_PROMPT, text)

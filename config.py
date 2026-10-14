@@ -18,13 +18,17 @@ import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from talk_api import load_env, env_flag, require_env
+from talk_api import load_env, env_flag, env_int, require_env
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Задержки удаления по умолчанию (можно переопределить в .env).
 _TEST_DELETE_DELAY_SEC = 3 * 60            # test: «через 3 минуты»
 _PROD_DELETE_DELAY_SEC = 7 * 24 * 3600     # prod: «через неделю»
+
+# Лестница повторов упавшей стадии (минуты ОТ ПЕРВОЙ ОШИБКИ): повторы через 5 мин, 30 мин,
+# 180 мин и 23 ч после неё. Не помог и последний — «до решения админа» (см. pipeline).
+_RETRY_DELAYS_MIN = (5, 30, 180, 23 * 60)
 
 
 @dataclass
@@ -33,7 +37,8 @@ class MMCfg:
     url: str = ""
     scheme: str = "https"
     port: int = 443
-    bot_token: str = ""
+    bot_token: str = ""            # основной бот: уведомления участникам, скачивание расшифровок
+    admin_bot_token: str = ""      # админ-бот: панель, команды, сводки (пусто -> всё в основном)
     bot_public_url: str = ""
     button_port: int = 8081
     button_secret: str = ""
@@ -48,8 +53,9 @@ class Cfg:
     delete_video_age_days: int  # видео старше N дней -> уведомить и удалить (по ТЗ — год)
     text_retention_days: int    # сколько хранить тексты после удаления видео; None -> НЕ удалять
     min_duration: int           # короче N секунд -> не транскрибируем, удаляем при подхвате
-    asr_max_attempts: int       # после N неудач транскрибации -> терминальный ASR_FAILED
-    emergency_hours: int        # если обработка «залипла» дольше N часов -> алерт админам
+    retry_delays_sec: tuple     # лестница повторов упавшей стадии (сек от первой ошибки)
+    admin_report_time: tuple    # (ч, м): когда слать админам суточную сводку об остановленных
+    admin_change_delay_sec: int  # период охлаждения решений обычного админа о составе админов
     shrink_warn_pct: int        # LLM-версия короче ASR более чем на N% -> баннер в _LLM.md
     delete_delay_sec: int   # через сколько после рассылки удалять видео
     real_delete: bool       # REAL_DELETE=1 -> реально удалять видео; 0 -> имитация (лог)
@@ -65,27 +71,46 @@ class Cfg:
 
 
 def _load_mm(env):
+    bot_token = (env.get("BOT_TOKEN") or "").strip()
+    admin_token = (env.get("ADMIN_BOT_TOKEN") or "").strip()
     return MMCfg(
         url=env.get("URL", ""),
         scheme=env.get("SCHEME", "https"),
-        port=int(env.get("PORT", "443") or "443"),
-        bot_token=env.get("BOT_TOKEN", ""),
+        port=env_int(env, "PORT", 443, minimum=1),
+        bot_token=bot_token,
+        # тот же токен, что у основного бота, — это НЕ второй бот: иначе одна учётка слушала
+        # бы личку дважды и отвечала на каждое сообщение и меню, и панелью
+        admin_bot_token="" if admin_token == bot_token else admin_token,
         bot_public_url=env.get("BOT_PUBLIC_URL", ""),
-        button_port=int(env.get("BUTTON_PORT", "8081") or "8081"),
+        button_port=env_int(env, "BUTTON_PORT", 8081, minimum=1),
         button_secret=env.get("BUTTON_SECRET", ""),
         verify=env_flag(env, "MM_VERIFY_SSL", "1"),
     )
 
 
 def _parse_hhmm(s):
-    """'HH:MM' -> (час, минута) или None, если пусто/некорректно (окно не задано)."""
-    if not s or ":" not in s:
+    """'ЧЧ:ММ' -> (час, минута); None — если пусто. «24:00» понимаем как полночь (00:00).
+    Некорректное время — ValueError: молча считать его «не заданным» нельзя, а час 24 или
+    минута 60 позже уронили бы расчёт границ окна."""
+    s = (s or "").strip()
+    if not s:
         return None
+    hh, mm = (int(x) for x in s.split(":"))     # не два числа через «:» -> ValueError
+    if (hh, mm) == (24, 0):
+        return 0, 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(s)
+    return hh, mm
+
+
+def _time(env, key):
+    """Время ЧЧ:ММ из env: None — если не задано; кривое значение — понятная ошибка на старте."""
+    raw = (env.get(key) or "").strip()
     try:
-        hh, mm = s.split(":")
-        return int(hh), int(mm)
+        return _parse_hhmm(raw)
     except ValueError:
-        return None
+        raise SystemExit(f"[!] {key}={raw!r}: ожидается время в формате ЧЧ:ММ (от 00:00 до "
+                         "23:59). Исправь .env и повтори.")
 
 
 # ---- утилиты рабочих окон (используются и демоном, и пайплайном) -----------
@@ -119,18 +144,49 @@ def next_open_local(now_local, window):
 
 def _window(env, prefix, fb_start, fb_end):
     """Окно из TIME_START_<prefix>/TIME_END_<prefix>, с фоллбэком на общие TIME_START/END."""
-    s = _parse_hhmm(env.get(f"TIME_START_{prefix}", "")) or fb_start
-    e = _parse_hhmm(env.get(f"TIME_END_{prefix}", "")) or fb_end
+    s = _time(env, f"TIME_START_{prefix}") or fb_start
+    e = _time(env, f"TIME_END_{prefix}") or fb_end
     return (s, e) if (s and e) else None
 
 
-def _int(env, key, default):
-    """Числовая переменная из env с устойчивостью к пустому/кривому значению -> default
-    (без падения на старте с трейсбеком int('') )."""
+def _strict_int(env, key):
+    """Целое неотрицательное число из env для настроек, где молча подставить значение по
+    умолчанию нельзя (сроки удаления видео и текстов). Пусто -> None; кривое или
+    отрицательное значение — понятная ошибка на старте, а не трейсбек."""
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return None
     try:
-        return int((env.get(key) or "").strip() or default)
-    except (ValueError, TypeError):
-        return int(default)
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise SystemExit(f"[!] {key}={raw!r}: ожидается целое число не меньше 0. "
+                         "Исправь .env и повтори.")
+    return value
+
+
+def _hours(env, key, default):
+    """Срок в часах из env (можно дробный — удобно в тесте) -> секунды. Пусто/криво/меньше
+    нуля -> default часов."""
+    try:
+        hours = float((env.get(key) or "").strip() or default)
+    except ValueError:
+        hours = default
+    return int((hours if hours >= 0 else default) * 3600)
+
+
+def _retry_delays(env):
+    """Лестница повторов из RETRY_DELAYS_MIN («5,30,180,1380» — минуты от первой ошибки;
+    можно дробные — удобно в тесте). Пусто/криво -> значения по умолчанию."""
+    raw = (env.get("RETRY_DELAYS_MIN") or "").strip()
+    try:
+        mins = [float(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        mins = []
+    if not mins or min(mins) < 0:
+        mins = _RETRY_DELAYS_MIN
+    return tuple(sorted({int(m * 60) for m in mins}))
 
 
 def load_cfg():
@@ -144,19 +200,20 @@ def load_cfg():
     default_delay = _PROD_DELETE_DELAY_SEC if real_delete else _TEST_DELETE_DELAY_SEC
     # DELETE_AFTER_NOTIFICATION (в секундах) — через сколько после ЛС удалять видео.
     # Фоллбэк на старое имя DELETE_DELAY_SEC; пусто/не задано -> дефолт (real=неделя / имит.=3мин).
-    _delay = (env.get("DELETE_AFTER_NOTIFICATION") or env.get("DELETE_DELAY_SEC") or "").strip()
-    delete_delay_sec = int(_delay) if _delay else default_delay
+    delete_delay_sec = _strict_int(env, "DELETE_AFTER_NOTIFICATION")
+    if delete_delay_sec is None:
+        delete_delay_sec = _strict_int(env, "DELETE_DELAY_SEC")
+    if delete_delay_sec is None:
+        delete_delay_sec = default_delay
 
     # TEXT_RETENTION_DAYS не задан (пусто) -> тексты НЕ удаляются никогда (None).
-    _retention = (env.get("TEXT_RETENTION_DAYS") or "").strip()
-    text_retention_days = int(_retention) if _retention else None
+    text_retention_days = _strict_int(env, "TEXT_RETENTION_DAYS")
 
     # Рабочие окна ОБЯЗАТЕЛЬНЫ. Фоллбэк — общие TIME_START/END. Если ни специфичные,
     # ни общие не заданы -> окно = None, и демон не стартует (fail-fast ниже).
-    asr_window = _window(env, "ASR", _parse_hhmm(env.get("TIME_START", "")),
-                         _parse_hhmm(env.get("TIME_END", "")))
-    llm_window = _window(env, "LLM", _parse_hhmm(env.get("TIME_START", "")),
-                         _parse_hhmm(env.get("TIME_END", "")))
+    common = _time(env, "TIME_START"), _time(env, "TIME_END")
+    asr_window = _window(env, "ASR", *common)
+    llm_window = _window(env, "LLM", *common)
     missing = [n for n, w in (("ASR", asr_window), ("LLM", llm_window)) if not w]
     if missing:
         raise SystemExit(
@@ -168,12 +225,13 @@ def load_cfg():
         out_dir=os.path.join(HERE, "Transcripts"),
         db_path=env.get("DB_PATH") or os.path.join(HERE, "data", "recordings.db"),
         language=env.get("ASR_LANGUAGE", "ru"),
-        delete_video_age_days=_int(env, "DELETE_VIDEO_AGE_DAYS", 365),
+        delete_video_age_days=env_int(env, "DELETE_VIDEO_AGE_DAYS", 365),
         text_retention_days=text_retention_days,
-        min_duration=_int(env, "MIN_DURATION", 60),
-        asr_max_attempts=max(1, _int(env, "ASR_MAX_ATTEMPTS", 5)),
-        emergency_hours=_int(env, "EMERGENCY", 24),
-        shrink_warn_pct=_int(env, "LLM_SHRINK_WARN_PCT", 5),
+        min_duration=env_int(env, "MIN_DURATION", 60),
+        retry_delays_sec=_retry_delays(env),
+        admin_report_time=_time(env, "ADMIN_REPORT_TIME") or (9, 0),
+        admin_change_delay_sec=_hours(env, "ADMIN_CHANGE_DELAY_HOURS", 24),
+        shrink_warn_pct=env_int(env, "LLM_SHRINK_WARN_PCT", 5),
         delete_delay_sec=delete_delay_sec,
         real_delete=real_delete,
         simulate_delete=not real_delete,
@@ -181,9 +239,10 @@ def load_cfg():
         # Каналы уведомления: реальная рассылка в Tag / на почту (иначе — заглушка в лог).
         send_to_tag=env_flag(env, "SEND_TO_TAG", "0"),
         send_to_mail=env_flag(env, "SEND_TO_MAIL", "0"),
-        admin_username=env.get("ADMIN_USERNAME", "").strip(),
+        # ник в Tag — строчными и без «@»: именно так он приходит от Tag при проверке прав
+        admin_username=(env.get("ADMIN_USERNAME") or "").strip().lstrip("@").lower(),
         asr_window=asr_window,
         llm_window=llm_window,
-        record_workers=max(1, _int(env, "RECORD_WORKERS", 4)),
+        record_workers=max(1, env_int(env, "RECORD_WORKERS", 4)),
         mm=_load_mm(env),
     )

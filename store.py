@@ -79,12 +79,15 @@ def strip_header(md):
 
 def _write(path, md):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:    # кодировка явно: не зависим от локали хоста
         f.write(md.rstrip() + "\n")
 
 
 def _read(path):
-    return open(path).read() if os.path.exists(path) else None
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 def write_asr_md(rd, key, md):
@@ -118,7 +121,33 @@ def read_short_md(rd, key):
     return _read(short_path(rd, key))
 
 
-def remove_record_dir(rd):
-    """Удалить папку записи целиком (5-летняя очистка текстов). Запись остаётся
-    «надгробием» в БД."""
+def _first_existing(*paths):
+    """Первый из путей, который существует на диске (или None). Пустые/None пропускаем."""
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def existing_path(row, kind):
+    """Путь к ГОТОВОМУ текстовому файлу записи по типу (asr/llm/short) или None, если файла
+    нет. row — строка БД. С фоллбэком на старое имя <ID>_full.md: так читаются записи,
+    обработанные до разделения на _ASR/_LLM."""
+    rd, key = row.get("rec_dir") or "", row["recording_key"]
+    if kind == "asr":            # базовая (дословная) расшифровка
+        return _first_existing(asr_path(rd, key), _old_full_path(rd, key))
+    if kind == "llm":            # улучшенная (LLM) расшифровка
+        return _first_existing(llm_path(rd, key), row.get("full_path"), _old_full_path(rd, key))
+    return _first_existing(row.get("short_path"), short_path(rd, key))   # краткая выжимка
+
+
+def remove_record_dir(rd, key):
+    """Удалить папку записи целиком (очистка текстов по сроку хранения). Запись остаётся
+    «надгробием» в БД. Две самопроверки: перед удалением — что это папка именно ЭТОЙ записи
+    (путь оканчивается её ключом), после — что папки действительно больше нет. Не удалось
+    — исключение: пометить тексты удалёнными, когда они лежат на диске, нельзя."""
+    if not rd or not key or os.path.basename(os.path.normpath(rd)) != key:
+        raise ValueError(f"путь {rd!r} не похож на папку записи {key!r} — удалять не буду")
     shutil.rmtree(rd, ignore_errors=True)
+    if os.path.exists(rd):
+        raise OSError(f"папку {rd} удалить не удалось (нет прав или файлы заняты)")

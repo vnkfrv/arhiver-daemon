@@ -26,7 +26,7 @@ import requests
 import urllib3
 
 from ratelimit import get_limiter
-from talk_api import load_env, env_flag
+from talk_api import load_env, env_flag, env_int
 
 log = logging.getLogger("asr")
 
@@ -35,6 +35,10 @@ log = logging.getLogger("asr")
 # ронял бы всю запись целиком.
 _RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF = 3.0
+
+# Предел на конвертацию одной дорожки. Обычно это секунды; зависший на битом файле ffmpeg
+# без предела занял бы воркер навсегда — запись при этом не падает и не уходит в повторы.
+_FFMPEG_TIMEOUT_SEC = 3600
 
 
 class MagnitASR:
@@ -46,8 +50,8 @@ class MagnitASR:
         self.model = env.get("MAGNITGPT_MODEL") or "MagnitGPT_ASR"
         self.verify = env_flag(env, "MAGNITGPT_VERIFY_SSL", "1")
         # ASR_CHUNK_SEC — на какие по длине куски резать дорожку перед отправкой.
-        # int(...) — потому что из .env всё приходит строкой.
-        self.chunk_sec = int(env.get("ASR_CHUNK_SEC", "600"))
+        # Из .env всё приходит строкой; пусто/криво -> 600, меньше 30 с не режем.
+        self.chunk_sec = env_int(env, "ASR_CHUNK_SEC", 600, minimum=30)
         if not self.key:
             raise SystemExit("[!] Не задан MAGNITGPT_API_KEY (env или .env)")
         if not self.verify:
@@ -118,12 +122,24 @@ class MagnitASR:
             # -f segment + -segment_time режут выход на куски по chunk_sec секунд;
             # -reset_timestamps 1 — каждый кусок начинает отсчёт времени с нуля
             # (поэтому реальное время = i*chunk_sec + время_внутри_куска).
-            # check=True => если ffmpeg упал, поднимется исключение.
-            subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
-                 "-f", "segment", "-segment_time", str(self.chunk_sec),
-                 "-reset_timestamps", "1", out],
-                check=True)
+            # -nostdin + stdin=DEVNULL — ffmpeg не ждёт ввода с терминала. stderr забираем
+            # себе: при сбое его последние строки уходят в текст ошибки (и в сводку админам),
+            # а не теряются в выводе контейнера.
+            name = os.path.basename(path)
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
+                     "-f", "segment", "-segment_time", str(self.chunk_sec),
+                     "-reset_timestamps", "1", out],
+                    check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, timeout=_FFMPEG_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"ffmpeg завис на дорожке {name} (дольше "
+                                   f"{_FFMPEG_TIMEOUT_SEC // 60} мин) и был остановлен") from None
+            except subprocess.CalledProcessError as ex:
+                tail = (ex.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-2:]
+                raise RuntimeError(f"ffmpeg не смог преобразовать дорожку {name}: "
+                                   + (" | ".join(tail) or f"код {ex.returncode}")) from None
             chunks = sorted(glob.glob(os.path.join(work, "chunk_*.wav")))  # sorted => по порядку 00000,00001
             # Куски дорожки шлём в ASR ПОСЛЕДОВАТЕЛЬНО (частота под лимитером внутри _call).
             # Параллелизм — на уровне ЗАПИСЕЙ: RECORD_WORKERS воркеров обрабатывают разные
@@ -140,14 +156,17 @@ class MagnitASR:
                         st = w.get("start")
                         # пропускаем пустые слова и слова без времени
                         if tx and st is not None:
-                            words.append((base + st, base + w.get("end", st), tx))
+                            en = w.get("end")               # бывает и "end": null
+                            words.append((base + st, base + (st if en is None else en), tx))
                 else:
                     # ОТКАТ: если модель вдруг не вернула пословные таймкоды —
                     # используем сегменты как крупные «слова», чтобы не потерять текст.
                     for s in (j.get("segments") or []):
                         tx = (s.get("text") or "").strip()
                         if tx and s.get("start") is not None:
-                            words.append((base + s["start"], base + s.get("end", s["start"]), tx))
+                            en = s.get("end")
+                            words.append((base + s["start"],
+                                          base + (s["start"] if en is None else en), tx))
             return words
         finally:
             # finally выполнится ВСЕГДА (даже при ошибке) — чистим временные файлы,

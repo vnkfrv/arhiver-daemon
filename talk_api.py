@@ -13,14 +13,16 @@ talk_api.py — КЛИЕНТ к API записей Контур.Толка + о�
 TALK_VERIFY_SSL.
 """
 
-import io          # обёртка над байтами в "файл в памяти" (для ZIP без записи на диск)
 import json
+import logging
 import os
 import re          # срезать инлайн-комментарии в .env
 import zipfile     # аудио-архив приходит как ZIP
 
 import requests    # HTTP-клиент
 import urllib3     # нужен только чтобы гасить предупреждение при verify=False
+
+log = logging.getLogger("talk")
 
 # Полный список переменных конфигурации проекта. Используется в load_env, чтобы
 # знать, какие ключи разрешено переопределять через окружение (export VAR=...),
@@ -34,11 +36,12 @@ _KNOWN_KEYS = (
     "REAL_DELETE", "TIME_START", "TIME_END",
     "TIME_START_ASR", "TIME_END_ASR", "TIME_START_LLM", "TIME_END_LLM",
     "RECORD_WORKERS", "DELETE_DELAY_SEC", "DELETE_AFTER_NOTIFICATION",
-    "DELETE_VIDEO_AGE_DAYS", "TEXT_RETENTION_DAYS", "MIN_DURATION", "ASR_MAX_ATTEMPTS",
+    "DELETE_VIDEO_AGE_DAYS", "TEXT_RETENTION_DAYS", "MIN_DURATION", "RETRY_DELAYS_MIN",
+    "ADMIN_REPORT_TIME", "ADMIN_CHANGE_DELAY_HOURS",
     "ASR_LANGUAGE", "FORCE_DELETE",
-    "DB_PATH", "ADMIN_USERNAME", "ASR_LLM_RPM", "EMERGENCY",
+    "DB_PATH", "ADMIN_USERNAME", "ASR_LLM_RPM",
     # Tag/Mattermost
-    "URL", "SCHEME", "PORT", "MM_VERIFY_SSL", "BOT_TOKEN",
+    "URL", "SCHEME", "PORT", "MM_VERIFY_SSL", "BOT_TOKEN", "ADMIN_BOT_TOKEN",
     "BOT_PUBLIC_URL", "BUTTON_PORT", "BUTTON_SECRET", "SEND_TO_TAG",
     # Почта (SMTP)
     "SEND_TO_MAIL", "SMTP_SERVER", "SMTP_PORT", "SMTP_SECURITY",
@@ -62,13 +65,14 @@ def load_env(path=".env"):
     # чтобы скрипт работал из любого каталога (например, из cron).
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
     if os.path.exists(p):
-        for line in open(p):
-            line = line.strip()
-            # пропускаем пустые строки и комментарии (#...)
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)          # split с maxsplit=1: значение может содержать "="
-                v = re.sub(r"\s+#.*$", "", v)       # срезаем инлайн-комментарий « #...» (с пробелом перед #)
-                env.setdefault(k.strip(), v.strip())  # setdefault: первая запись побеждает
+        with open(p, encoding="utf-8") as f:       # кодировка явно: не зависим от локали хоста
+            for line in f:
+                line = line.strip()
+                # пропускаем пустые строки и комментарии (#...)
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)          # split с maxsplit=1: значение может содержать "="
+                    v = re.sub(r"\s+#.*$", "", v)       # срезаем инлайн-комментарий « #...» (с пробелом перед #)
+                    env.setdefault(k.strip(), v.strip())  # setdefault: первая запись побеждает
     # Наложение окружения поверх файла. Берём объединение ключей из файла и известных.
     for k in set(list(env) + list(_KNOWN_KEYS)):
         if os.getenv(k) is not None:               # именно "is not None": пустая строка тоже валидна
@@ -83,6 +87,18 @@ def env_flag(env, key, default="1"):
     например для verify SSL.
     """
     return str(env.get(key, default)).strip().lower() not in ("0", "false", "no", "")
+
+
+def env_int(env, key, default, minimum=None):
+    """
+    Целое число из env. Пусто или не число -> default (а не падение на int('') посреди
+    работы); minimum — нижняя граница значения.
+    """
+    try:
+        value = int(str(env.get(key) or "").strip() or default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return value if minimum is None else max(minimum, value)
 
 
 def require_env(env, *keys):
@@ -103,6 +119,20 @@ def hhmmss(sec):
     """Секунды (число) -> строка 'ЧЧ:ММ:СС'. Используется для таймкодов в расшифровке."""
     sec = int(sec)     # таймкоды приходят float (85.32) -> для // и % нужно целое
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+class NoAudio(Exception):
+    """Толк сообщил, что у записи НЕТ аудио — транскрибировать нечего (терминально).
+    Отдельный тип, чтобы не путать с 4xx от шлюза ASR: тот — сбой, а не «нет звука»."""
+
+
+def _talk_error(body):
+    """Текст ошибки из ответа Толка ({"errorMessage": "..."}) или '' — если это не он."""
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        return ""
+    return str(data.get("errorMessage") or "") if isinstance(data, dict) else ""
 
 
 class TalkClient:
@@ -201,10 +231,17 @@ class TalkClient:
 
         Берём participants из recording_detail, затем каждому резолвим email через
         user_info(login). Имя собираем из firstname+surname. Если у участника нет
-        login (анонимный) или почта недоступна — email=None (обработаем выше).
+        login (анонимный) или его профиля в Толке больше нет — email=None (обработаем выше).
+
+        СБОЙ запроса профиля (сеть, 5xx, неверный ключ) пробрасываем: участник без почты
+        не увидит запись в боте и не получит уведомление об удалении, а список участников
+        сохраняется один раз — стадию надо повторить, а не терять людей молча. Так же
+        поступаем, если Толк не отдал НИ ОДНОГО профиля и хотя бы раз ответил «нет доступа»:
+        это не «у людей нет профилей», а у API-ключа нет прав их читать.
         """
         detail = self.recording_detail(key)
         out = []
+        resolved = denied = 0                   # сколько профилей получили / на сколько «нет доступа»
         for p in detail.get("participants", []):
             ui = p.get("userInfo") or {}
             login = ui.get("login")
@@ -213,12 +250,22 @@ class TalkClient:
             if login:
                 try:
                     info = self.user_info(login)    # один запрос: и email, и статus disabled
-                    email = info.get("email")
+                except requests.HTTPError as ex:
+                    code = getattr(ex.response, "status_code", None)
+                    if code not in (400, 403, 404, 410):
+                        raise                       # не «профиля нет», а сбой — повторим стадию
+                    denied += code == 403
+                    log.warning("профиль участника %s (%s) в Толке недоступен (HTTP %s) — "
+                                "он останется без почты", name or "?", login, code)
+                else:
+                    resolved += 1
+                    email = (info.get("email") or "").strip() or None
                     disabled = bool(info.get("disabled"))
-                except Exception:
-                    email = None                    # недоступен профиль — оставим None
             out.append({"name": name or (p.get("anonymousName") or "?"),
                         "email": email, "login": login, "disabled": disabled})
+        if denied and not resolved:
+            raise requests.HTTPError("Толк не отдал ни одного профиля участников (403 — нет "
+                                     "доступа): проверь права API-ключа на чтение пользователей")
         return out
 
     def download_video(self, key, dest_path):
@@ -249,28 +296,55 @@ class TalkClient:
         return r.status_code
 
     # ---- аудио ---------------------------------------------------------
-    def audio_zip(self, key) -> bytes:
+    def audio_zip(self, key, dest_path):
         """
-        Скачать аудио-архив записи как сырые байты. Это НЕПУБЛИЧНЫЙ эндпоинт: он
+        Скачать аудио-архив записи в файл dest_path. Это НЕПУБЛИЧНЫЙ эндпоинт: он
         отдаёт ZIP (application/octet-stream), а не JSON. Внутри — сведённый
         audio.m4a, поканальные дорожки channels/*.webm (по одной на спикера) и
         info.json с именами спикеров и их startAt.
-        timeout=600: архив многолюдной часовой встречи может быть большим.
+
+        Стримом на диск, а не в память: архив многолюдной часовой встречи весит сотни
+        мегабайт, а записи обрабатывают несколько воркеров одновременно.
+        timeout=600 — на каждую порцию данных, не на весь архив.
+
+        «Аудио нет» — NoAudio: Толк отвечает {"errorMessage": "Recording has no audio record"}
+        либо 404 (записи уже нет). Прочие ошибки — исключение: это сбой, стадию повторим.
         """
-        r = self.s.get(f"{self.base}/api/recordings/{key}/audio", timeout=600)
-        r.raise_for_status()                # если аудио нет — прилетит 400/404, обработаем выше (в batch)
-        return r.content
+        with self.s.get(f"{self.base}/api/recordings/{key}/audio", stream=True, timeout=600) as r:
+            if r.status_code in (400, 404):
+                msg = _talk_error(r.content)
+                if r.status_code == 404 or "no audio" in msg.lower():
+                    raise NoAudio(f"{r.status_code}: {msg or 'аудио нет'}")
+                raise requests.HTTPError(f"{r.status_code}: {msg or r.reason}", response=r)
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(1 << 20):   # по 1 МБ
+                    if chunk:
+                        f.write(chunk)
+        return dest_path
 
     def download_audio(self, key, out_dir):
         """
         Скачать архив и РАСПАКОВАТЬ его в out_dir. Возвращает (info, список файлов).
-        io.BytesIO оборачивает байты в «файл в памяти», чтобы zipfile мог с ними
-        работать без сохранения промежуточного .zip на диск.
+        Сам архив — временный файл в той же папке; после распаковки он удаляется.
         """
         os.makedirs(out_dir, exist_ok=True)
-        z = zipfile.ZipFile(io.BytesIO(self.audio_zip(key)))
-        z.extractall(out_dir)                              # распаковываем все дорожки на диск
-        info = {}
-        if "info.json" in z.namelist():                    # namelist() — имена файлов внутри ZIP
-            info = json.loads(z.read("info.json"))         # метаданные: кто говорит, с какой секунды
-        return info, z.namelist()
+        zip_path = os.path.join(out_dir, "_audio.zip")
+        self.audio_zip(key, zip_path)
+        try:
+            z = zipfile.ZipFile(zip_path)
+        except zipfile.BadZipFile:
+            # вместо архива пришёл JSON с той же ошибкой «нет аудио» (но с кодом 200)
+            with open(zip_path, "rb") as f:
+                msg = _talk_error(f.read(65536))
+            if "no audio" in msg.lower():
+                raise NoAudio(msg)
+            raise
+        with z:
+            names = z.namelist()                               # имена файлов внутри ZIP
+            z.extractall(out_dir)                              # распаковываем все дорожки на диск
+            info = {}
+            if "info.json" in names:
+                info = json.loads(z.read("info.json"))         # метаданные: кто говорит, с какой секунды
+        os.remove(zip_path)                                    # архив больше не нужен — освобождаем место
+        return info, names

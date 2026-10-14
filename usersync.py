@@ -11,6 +11,7 @@ usersync.py — наполнение таблицы users (участники к
 import logging
 
 import db
+from util import err as _err, username_from_email
 
 log = logging.getLogger("usersync")
 
@@ -24,7 +25,9 @@ def sync_user(conn, participant, mm=None):
         return None                              # без почты слать некуда — не заводим
     if participant.get("disabled"):
         return None                              # деактивированный аккаунт — пропуск
-    username = email.split("@", 1)[0]
+    username = username_from_email(email)
+    if not username:
+        return None
     if db.get_user(conn, username):
         return username                          # уже есть — не дёргаем API повторно
 
@@ -53,4 +56,6 @@ def sync_participants(conn, participants, mm=None):
         try:
             sync_user(conn, p, mm)
         except Exception as ex:
-            log.debug("sync_user пропущен (%s): %s", p.get("email"), ex)
+            # не заведён — не получит единоразовое уведомление о старых записях: это должно
+            # быть видно в логе (попробуем снова на следующей записи с этим участником)
+            log.warning("пользователь %s не заведён в базе: %s", p.get("email"), _err(ex))

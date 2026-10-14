@@ -12,7 +12,7 @@ import collections
 import threading
 import time
 
-from talk_api import load_env
+from talk_api import load_env, env_int
 
 
 class RateLimiter:
@@ -46,5 +46,5 @@ def get_limiter():
     if _LIMITER is None:
         with _INIT:
             if _LIMITER is None:
-                _LIMITER = RateLimiter(int(load_env().get("ASR_LLM_RPM", "30")))
+                _LIMITER = RateLimiter(env_int(load_env(), "ASR_LLM_RPM", 30, minimum=1))
     return _LIMITER
