@@ -122,13 +122,14 @@ class MagnitASR:
             # -f segment + -segment_time режут выход на куски по chunk_sec секунд;
             # -reset_timestamps 1 — каждый кусок начинает отсчёт времени с нуля
             # (поэтому реальное время = i*chunk_sec + время_внутри_куска).
+            # -vn — берём только звук (для видео: картинку не декодируем вовсе).
             # -nostdin + stdin=DEVNULL — ffmpeg не ждёт ввода с терминала. stderr забираем
             # себе: при сбое его последние строки уходят в текст ошибки (и в сводку админам),
             # а не теряются в выводе контейнера.
             name = os.path.basename(path)
             try:
                 subprocess.run(
-                    ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "16000",
                      "-f", "segment", "-segment_time", str(self.chunk_sec),
                      "-reset_timestamps", "1", out],
                     check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -137,7 +138,7 @@ class MagnitASR:
                 raise RuntimeError(f"ffmpeg завис на дорожке {name} (дольше "
                                    f"{_FFMPEG_TIMEOUT_SEC // 60} мин) и был остановлен") from None
             except subprocess.CalledProcessError as ex:
-                tail = (ex.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-2:]
+                tail = (ex.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-4:]
                 raise RuntimeError(f"ffmpeg не смог преобразовать дорожку {name}: "
                                    + (" | ".join(tail) or f"код {ex.returncode}")) from None
             chunks = sorted(glob.glob(os.path.join(work, "chunk_*.wav")))  # sorted => по порядку 00000,00001
@@ -149,6 +150,8 @@ class MagnitASR:
                 base = offset + i * self.chunk_sec     # абсолютное время начала этого куска
                 log.debug("  ASR кусок %d/%d", i + 1, len(chunks))
                 j = self._call(ch, language)
+                if not isinstance(j, dict):
+                    raise RuntimeError(f"ASR вернул не объект, а {type(j).__name__}")
                 jwords = j.get("words")
                 if jwords:
                     for w in jwords:
@@ -158,7 +161,7 @@ class MagnitASR:
                         if tx and st is not None:
                             en = w.get("end")               # бывает и "end": null
                             words.append((base + st, base + (st if en is None else en), tx))
-                else:
+                elif j.get("segments"):
                     # ОТКАТ: если модель вдруг не вернула пословные таймкоды —
                     # используем сегменты как крупные «слова», чтобы не потерять текст.
                     for s in (j.get("segments") or []):
@@ -167,6 +170,11 @@ class MagnitASR:
                             en = s.get("end")
                             words.append((base + s["start"],
                                           base + (s["start"] if en is None else en), tx))
+                elif (j.get("text") or "").strip():
+                    # САМОПРОВЕРКА: текст есть, а таймкодов нет — формат ответа не тот. Это сбой
+                    # (повторим по лестнице), а не тишина: иначе запись ушла бы в «без аудио».
+                    raise RuntimeError("ASR вернул текст без таймкодов слов и фраз — "
+                                       "проверь response_format шлюза")
             return words
         finally:
             # finally выполнится ВСЕГДА (даже при ошибке) — чистим временные файлы,

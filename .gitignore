@@ -17,3 +17,6 @@ state.json
 .DS_Store
 logggs.txt
 stuff/
+# сертификат и ключ nginx — только на ВМ
+nginx/certs/*
+!nginx/certs/README.txt

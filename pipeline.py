@@ -349,15 +349,17 @@ def process(ctx, key, do_asr=True, do_llm=True):
         try:
             tr = build_transcript(ctx.client, key, ctx.asr, cfg.language)
             store.write_transcript(rd, key, tr.blocks)      # тело расшифровки (шапку добавит save_to_db)
-        except NoAudio as ex:                               # Толк сам сказал «аудио нет» — терминально
+        except NoAudio as ex:              # звука нет ни в архиве, ни в видео (или он пуст) — терминально
             commit(no_audio=1, last_error=_err(ex), error_since=None, fail_stage=None, fail_count=0)
-            log.info("нет аудио — запись пропущена: %s", ex)
+            log.info("запись без аудио — пропущена: %s", ex)
             return finish()
         except Exception as ex:
             return hold("transcribe") if fail("transcribe", ex) else finish()
         ok(transcribed=1, no_channels=int(tr.no_channels), status=statuses.TRANSCRIBED)
-        if tr.no_channels:
-            log.info("запись без дорожек по спикерам — распознана сведённая дорожка")
+        log.info("транскрибация готова: %s, реплик %d", {
+            "channels": "по дорожкам спикеров", "mixed": "по общей дорожке (без дорожек спикеров)",
+            "video": "по звуку из видео (аудиоархива нет)"}.get(tr.info.get("source"), "?"),
+            len(tr.blocks))
 
     # --- СТАДИЯ 2: улучшение через LLM (LLM-окно) ---
     if row.get("transcribed") and llm_ok and not row.get("improved") and do_llm:

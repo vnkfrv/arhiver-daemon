@@ -18,6 +18,7 @@ import logging
 import os
 import re          # срезать инлайн-комментарии в .env
 import zipfile     # аудио-архив приходит как ZIP
+from urllib.parse import quote
 
 import requests    # HTTP-клиент
 import urllib3     # нужен только чтобы гасить предупреждение при verify=False
@@ -38,7 +39,7 @@ _KNOWN_KEYS = (
     "RECORD_WORKERS", "DELETE_DELAY_SEC", "DELETE_AFTER_NOTIFICATION",
     "DELETE_VIDEO_AGE_DAYS", "TEXT_RETENTION_DAYS", "MIN_DURATION", "RETRY_DELAYS_MIN",
     "ADMIN_REPORT_TIME", "ADMIN_CHANGE_DELAY_HOURS",
-    "ASR_LANGUAGE", "FORCE_DELETE",
+    "ASR_LANGUAGE", "FORCE_DELETE", "TALK_VIDEO_QUALITY",
     "DB_PATH", "ADMIN_USERNAME", "ASR_LLM_RPM",
     # Tag/Mattermost
     "URL", "SCHEME", "PORT", "MM_VERIFY_SSL", "BOT_TOKEN", "ADMIN_BOT_TOKEN",
@@ -46,6 +47,8 @@ _KNOWN_KEYS = (
     # Почта (SMTP)
     "SEND_TO_MAIL", "SMTP_SERVER", "SMTP_PORT", "SMTP_SECURITY",
     "SMTP_SENDER", "SMTP_LOGIN", "SMTP_PASSWORD",
+    # Логи: 1 — полные трейсбеки (по умолчанию ошибка пишется одной строкой)
+    "LOG_TRACEBACKS",
 )
 
 
@@ -121,6 +124,17 @@ def hhmmss(sec):
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
 
 
+# Участники записи: Толк отдаёт их страницами не больше 100; предохранитель от бесконечной пагинации.
+_PARTICIPANTS_PAGE = 100
+_PARTICIPANTS_MAX_PAGES = 100
+
+
+def _participant_id(p):
+    """Чем участники различаются между страницами: login, а у анонимов — их id или имя."""
+    ui = p.get("userInfo") or {}
+    return ui.get("login") or p.get("anonymousId") or p.get("anonymousName") or id(p)
+
+
 class NoAudio(Exception):
     """Толк сообщил, что у записи НЕТ аудио — транскрибировать нечего (терминально).
     Отдельный тип, чтобы не путать с 4xx от шлюза ASR: тот — сбой, а не «нет звука»."""
@@ -146,6 +160,10 @@ class TalkClient:
         self.base = (env.get("TALK_BASE_URL") or "").rstrip("/")  # rstrip('/') чтобы не было '//' в URL
         token = env.get("TALK_API_TOKEN") or ""
         verify = env_flag(env, "TALK_VERIFY_SSL", "0")            # проверять ли TLS-сертификат
+        # Качество видео для скачивания (GET /api/Recordings/{key}/file[/{качество}]). По умолчанию —
+        # без качества (Толк отдаёт исходное видео); не вышло — пробуем «900p» из документации.
+        self.video_qualities = list(dict.fromkeys(
+            [(env.get("TALK_VIDEO_QUALITY") or "").strip(), "", "900p", "900 p"]))
         # Ранняя и понятная ошибка вместо загадочных падений позже, если конфиг пуст.
         if not self.base or not token:
             raise SystemExit("[!] Заполни TALK_BASE_URL и TALK_API_TOKEN в .env")
@@ -206,12 +224,39 @@ class TalkClient:
             if len(ents) < page_size or not page_token or not new:
                 return
 
-    def recording_detail(self, key):
-        """Полные метаданные записи (title, createdDate, duration, participantsCount,
-        roomName, size, canBeRemoved и т.д.) — для technical_info.json."""
-        r = self.s.get(f"{self.base}/api/Domain/recordings/{key}", timeout=30)
+    def recording_detail(self, key, max_participants=None):
+        """Метаданные записи (title, createdDate, duration, participantsCount, canBeRemoved…).
+        ВАЖНО: участников здесь Толк отдаёт не больше maxParticipantCount (по умолчанию 6) —
+        полный список даёт participants()."""
+        params = {"maxParticipantCount": max_participants} if max_participants else None
+        r = self.s.get(f"{self.base}/api/Domain/recordings/{key}", params=params, timeout=30)
         r.raise_for_status()
         return r.json()
+
+    def participants(self, key):
+        """ВСЕ участники записи — постранично, GET /api/Domain/recordings/{key}/participants
+        (по 100 за запрос). Элементы — как в recording_detail: {userInfo: {login, firstname,
+        surname, ...}} или {anonymousName, anonymousId}. Если метода участников на этой
+        установке Толка нет (404) — берём из деталей записи с большим пределом."""
+        out, seen = [], set()
+        for page in range(_PARTICIPANTS_MAX_PAGES):
+            r = self.s.get(f"{self.base}/api/Domain/recordings/{key}/participants",
+                           params={"skip": page * _PARTICIPANTS_PAGE, "top": _PARTICIPANTS_PAGE},
+                           timeout=30)
+            if r.status_code == 404 and page == 0:
+                log.warning("метод участников записи недоступен (404) — беру их из деталей записи")
+                return list(self.recording_detail(key, max_participants=1000).get("participants") or [])
+            r.raise_for_status()
+            items = r.json()
+            if not isinstance(items, list):
+                raise ValueError(f"участники записи: ожидали список, пришло {type(items).__name__}")
+            new = [p for p in items if _participant_id(p) not in seen]
+            for p in new:
+                seen.add(_participant_id(p))
+            out.extend(new)
+            if len(items) < _PARTICIPANTS_PAGE or not new:   # последняя страница / одни повторы
+                return out
+        raise RuntimeError(f"участников записи больше {len(out)} — пагинация не закончилась")
 
     def user_info(self, login):
         """
@@ -229,7 +274,7 @@ class TalkClient:
         """
         Список участников записи с почтами: [{"name","email","login"}].
 
-        Берём participants из recording_detail, затем каждому резолвим email через
+        Берём ВСЕХ участников (participants(), постранично), затем каждому резолвим email через
         user_info(login). Имя собираем из firstname+surname. Если у участника нет
         login (анонимный) или его профиля в Толке больше нет — email=None (обработаем выше).
 
@@ -239,10 +284,9 @@ class TalkClient:
         поступаем, если Толк не отдал НИ ОДНОГО профиля и хотя бы раз ответил «нет доступа»:
         это не «у людей нет профилей», а у API-ключа нет прав их читать.
         """
-        detail = self.recording_detail(key)
         out = []
         resolved = denied = 0                   # сколько профилей получили / на сколько «нет доступа»
-        for p in detail.get("participants", []):
+        for p in self.participants(key):
             ui = p.get("userInfo") or {}
             login = ui.get("login")
             name = " ".join(x for x in (ui.get("firstname"), ui.get("surname")) if x).strip()
@@ -270,19 +314,35 @@ class TalkClient:
 
     def download_video(self, key, dest_path):
         """
-        Скачать ВИДЕО записи (mp4) в dest_path — GET /api/recordings/{key}/file.
-        Стримом, чтобы не держать большой файл целиком в памяти. Нужен боту (Этап B)
-        для кнопки «Видеозапись» и для проверки, что видео ещё не удалено.
+        Скачать ВИДЕО записи (mp4) в dest_path — GET /api/Recordings/{key}/file/{качество}.
+        Стримом, чтобы не держать большой файл целиком в памяти. Нужно, когда у записи нет
+        аудиоархива: звук берём из видео (transcribe.py).
+
+        Качество — из TALK_VIDEO_QUALITY (по умолчанию без качества — исходное видео); если Толк так
+        не отдаёт (400/404), пробуем «900p» из документации.
+        Сработавший вариант запоминаем и дальше пробуем первым. 400/404 на всех вариантах —
+        HTTPError с этим кодом: видео у записи нет.
         """
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
-        with self.s.get(f"{self.base}/api/recordings/{key}/file",
-                        stream=True, timeout=600) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(1 << 20):   # по 1 МБ
-                    if chunk:
-                        f.write(chunk)
-        return dest_path
+        last = None
+        for q in self.video_qualities:
+            url = f"{self.base}/api/Recordings/{key}/file" + (f"/{quote(q, safe='')}" if q else "")
+            with self.s.get(url, stream=True, timeout=600) as r:
+                if r.status_code in (400, 404):
+                    last = requests.HTTPError(f"{r.status_code}: {_talk_error(r.content) or r.reason}",
+                                              response=r)
+                    continue                            # нет такого качества (или видео) — дальше
+                r.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):   # по 1 МБ
+                        if chunk:
+                            f.write(chunk)
+            if q != self.video_qualities[0]:
+                log.info("видео отдаётся с качеством %r — дальше пробую его первым", q or "без качества")
+                self.video_qualities.remove(q)
+                self.video_qualities.insert(0, q)
+            return dest_path
+        raise last
 
     def delete_recording(self, key, force=False):
         """

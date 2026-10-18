@@ -58,6 +58,7 @@ from flask import Flask, request, jsonify
 
 import admin
 import db
+import logsetup
 import store
 import texts as T
 from config import load_cfg
@@ -112,6 +113,17 @@ def _user(user_id):
         return {}
     _users[user_id] = (time.monotonic(), u)
     return u
+
+
+def _peer():
+    """Откуда пришёл запрос (для логов): за nginx — адрес из X-Real-IP, иначе сам адрес."""
+    return request.headers.get("X-Real-IP") or request.remote_addr
+
+
+def _who(user_id):
+    """Кто это — для логов: «@ник», а если Tag не ответил — id."""
+    name = _user(user_id).get("username") if user_id else None
+    return f"@{name}" if name else str(user_id or "?")
 
 
 def _email(user_id):
@@ -699,12 +711,15 @@ def _authorized(expected):
 def action():
     """Callback интерактивных кнопок и выпадающих списков."""
     if not _authorized(mm.secret):
+        log.warning("/action: запрос с %s с неверным секретом в адресе — отклонён "
+                    "(BUTTON_SECRET у кнопки и у бота разный?)", _peer())
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, dict):            # мусор вместо JSON-объекта — не наш запрос
         data = {}
     ctx = data.get("context") or {}
     act = str(ctx.get("action") or "") if isinstance(ctx, dict) else ""
+    log.info("нажатие: %s от %s (с %s)", act or "?", _who(data.get("user_id")), _peer())
     client = None                 # бот, в чьей личке нажали (известен после проверок)
     try:
         if act not in USER_ACTIONS and act not in ADMIN_ACTIONS:
@@ -742,6 +757,8 @@ def action():
 def dialog():
     """Отправка модалки. Ошибки заполнения возвращаем в саму модалку (errors)."""
     if not _authorized(mm.dialog_token):
+        log.warning("/dialog: запрос с %s с неверным токеном в адресе — отклонён",
+                    _peer())
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, dict):
@@ -749,6 +766,7 @@ def dialog():
     if data.get("cancelled"):
         return jsonify({})
     cb = data.get("callback_id")
+    log.info("окно: %s от %s", cb or "?", _who(data.get("user_id")))
     st = mm.unpack(data.get("state"))
     # state подписан и привязан к пользователю: чужую или поддельную форму не принимаем
     if not st or st.get("uid") != data.get("user_id") or not st.get("ch"):
@@ -850,17 +868,45 @@ async def _handle_event(raw, client, on_message):
         return
     if str((post.get("props") or {}).get("from_bot") or "").lower() == "true":
         return                                     # ботам не отвечаем: два бота зациклились бы
-    text = (post.get("message") or "").strip()
-    # Оборачиваем: ошибка обработки одного сообщения (напр. сбой сети к Tag) НЕ должна
-    # ронять всю WebSocket-сессию.
+    # Всё, что ходит в сеть (профиль для лога, сам обработчик — Tag/Talk через requests),
+    # — в отдельном потоке: event loop остаётся свободным и отвечает на ping сервера.
+    # Если бы он стоял, пока Tag отвечает медленно, MM закрыл бы соединение и сообщения
+    # за время переподключения потерялись. Ждём поток здесь же — порядок сообщений
+    # сохраняется.
+    await asyncio.to_thread(_process_post, post, client, on_message)
+
+
+def _process_post(post, client, on_message):
+    """Личное сообщение боту (в потоке). Ошибка одного сообщения (напр. сбой сети к Tag)
+    НЕ роняет WebSocket-сессию."""
     try:
+        text = (post.get("message") or "").strip()
+        log.info("сообщение боту @%s от %s: %s", client.username, _who(post.get("user_id")),
+                 text[:200] + ("…" if len(text) > 200 else ""))
         on_message(text, post["user_id"], post["channel_id"])
     except Exception:
         log.exception("обработка сообщения от %s не удалась", post.get("user_id"))
 
 
+_WS_RETRY_SEC = 5
+# Пока Tag недоступен, повтор каждые 5 с; в лог — первая неудача и дальше раз в минуту.
+_WS_LOG_EVERY = 12
+
+
+def _is_hello(raw):
+    """Событие hello: сервер принял аутентификацию — соединение рабочее."""
+    try:
+        return json.loads(raw).get("event") == "hello"
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 async def _ws_loop(client, on_message):
-    """Слушать ЛС одного бота (у каждой учётки Tag — своё WebSocket-соединение)."""
+    """Слушать ЛС одного бота (у каждой учётки Tag — своё WebSocket-соединение).
+
+    Связь держится вечно: при обрыве — повтор каждые 5 с. Рабочим соединение считается
+    после события hello (сервер принял токен): так обрывы сразу после подключения
+    (например, неверный токен) не превращаются в пару строк лога каждые 5 с."""
     ws_scheme = "wss" if client.scheme == "https" else "ws"
     url = f"{ws_scheme}://{client.host}:{client.port}/api/v4/websocket"
     if client.scheme == "https":
@@ -873,25 +919,43 @@ async def _ws_loop(client, on_message):
         connect_kwargs = {}
 
     import websockets
+    failures = 0
     while True:
         try:
             async with websockets.connect(url, **connect_kwargs) as ws:
                 # аутентификация бота в сокете
                 await ws.send(json.dumps({"seq": 1, "action": "authentication_challenge",
                                           "data": {"token": client.token}}))
-                log.info("WebSocket подключён (@%s): %s", client.username, url)
+                online = False
                 async for raw in ws:
+                    if not online and _is_hello(raw):
+                        online = True
+                        if failures:
+                            log.info("WebSocket @%s: связь восстановлена (неудачных попыток: %d)",
+                                     client.username, failures)
+                        else:
+                            log.info("WebSocket подключён (@%s): %s", client.username, url)
+                        failures = 0
                     await _handle_event(raw, client, on_message)
+            reason = "соединение закрыто сервером"
         except Exception as ex:
-            log.warning("WebSocket @%s: переподключение через 5с (%s: %s)",
-                        client.username, type(ex).__name__, ex)
-            await asyncio.sleep(5)
+            reason = f"{type(ex).__name__}: {' '.join(str(ex).split())[:200]}"
+        failures += 1
+        if failures == 1 or failures % _WS_LOG_EVERY == 0:
+            log.warning("WebSocket @%s: нет связи (%s) — переподключаюсь каждые %d с (попытка %d)",
+                        client.username, reason, _WS_RETRY_SEC, failures)
+        await asyncio.sleep(_WS_RETRY_SEC)
 
 
 def _run_ws(client, on_message):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(_ws_loop(client, on_message))
+    try:
+        loop.run_until_complete(_ws_loop(client, on_message))
+    except Exception:
+        # сюда попадаем, только если сломалось само подключение (не сеть — её цикл переживает)
+        log.exception("WebSocket @%s остановлен: личные сообщения этому боту не принимаются",
+                      client.username)
 
 
 # =========================================================================
@@ -911,6 +975,9 @@ def main():
     # werkzeug пишет строку каждого запроса (с ?t=<секрет>) — глушим access-лог,
     # чтобы BUTTON_SECRET не утекал в bot.log.
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    # Ошибки — одной строкой (трейсбек сворачивается); LOG_TRACEBACKS=1 — полные трейсбеки.
+    if logsetup.condense_tracebacks():
+        log.warning("LOG_TRACEBACKS=1 — в логах будут полные трейсбеки (режим отладки)")
 
     bots = [("бот", "BOT_TOKEN", mm)] + ([("админ-бот", "ADMIN_BOT_TOKEN", amm)] if amm is not mm else [])
     for name, var, client in bots:

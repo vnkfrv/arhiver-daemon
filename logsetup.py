@@ -9,14 +9,22 @@ logsetup.py — единая настройка логов демона.
     последовательный лог того, что этот воркер делал;
   • общий logs/daemon.log + консоль (то же самое, для обзора).
 
+Ошибки — одной строкой, без простыней трейсбеков: фильтр на обработчиках
+сворачивает любую запись с трейсбеком (log.exception, «Exception on /action» из
+Flask и т.п.) в строку «… — Тип: сообщение [файл.py:строка функция > …]». Полные
+трейсбеки для отладки включает LOG_TRACEBACKS=1 в .env.
+
 Использование:
-    logsetup.setup(LOG_DIR)                # один раз на старте
+    logsetup.setup(LOG_DIR)                # демон: один раз на старте
+    logsetup.condense_tracebacks()         # бот: после своего basicConfig
     logsetup.set_record(key) / clear_record()   # вокруг обработки одной записи
 """
 
 import logging
 import os
+import sys
 import threading
+import traceback
 from logging.handlers import RotatingFileHandler
 
 # Лимиты ротации: файл не растёт больше _MAX_BYTES, храним _BACKUPS прошлых кусков.
@@ -27,6 +35,82 @@ _WORKER_MAX_BYTES = 20 * 1024 * 1024  # 20 МБ на лог воркера
 _WORKER_BACKUPS = 3
 
 _ctx = threading.local()
+
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_MAX_MESSAGE = 300   # длинные сообщения исключений (тела ответов API) обрезаем
+
+
+def brief(e):
+    """Исключение одной строкой: тип, сообщение (≤300 симв.) и место — два последних
+    кадра НАШЕГО кода (не библиотек): «[bot.py:210 _deliver > mm_client.py:103 _request]»."""
+    if e is None:
+        return "нет данных об ошибке"
+    frames = traceback.extract_tb(e.__traceback__) if e.__traceback__ else []
+    ours = [f for f in frames
+            if f.filename.startswith(_PROJECT_DIR) and "site-packages" not in f.filename]
+    where = (" [" + " > ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in ours[-2:]) + "]"
+             if ours else "")
+    msg = " ".join(str(e).split())
+    if len(msg) > _MAX_MESSAGE:
+        msg = msg[:_MAX_MESSAGE] + "…"
+    return f"{type(e).__name__}: {msg}{where}" if msg else f"{type(e).__name__}{where}"
+
+
+class _CondenseTracebacks(logging.Filter):
+    """Сворачивает трейсбек записи в одну строку (если полные трейсбеки не включены)."""
+    def __init__(self, full_tracebacks=False):
+        super().__init__()
+        self.full = full_tracebacks
+
+    def filter(self, record):
+        if record.exc_info and not self.full:
+            try:
+                text = record.getMessage()
+            except Exception:  # кривые аргументы записи не должны ронять лог
+                text = str(record.msg)
+            record.msg = f"{text} — {brief(record.exc_info[1])}"
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+def tracebacks_from_env():
+    """LOG_TRACEBACKS из .env/окружения (тот же разбор, что у config)."""
+    from talk_api import load_env, env_flag   # импорт здесь: talk_api тянет requests
+    return env_flag(load_env(), "LOG_TRACEBACKS", "0")
+
+
+def _install_excepthooks():
+    """Необработанное исключение (в главном или фоновом потоке) — в лог, а не голым
+    трейсбеком в stderr мимо логирования: так и оно сворачивается в одну строку."""
+    crash = logging.getLogger("crash")
+
+    def main_hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return sys.__excepthook__(exc_type, exc, tb)
+        crash.critical("необработанная ошибка — процесс завершается", exc_info=(exc_type, exc, tb))
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        crash.error("необработанная ошибка в потоке %s — поток остановлен",
+                    getattr(args.thread, "name", "?"),
+                    exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = main_hook
+    threading.excepthook = thread_hook
+
+
+def condense_tracebacks(handlers=None, full=None):
+    """Повесить на обработчики (по умолчанию — корневого логгера) фильтр «трейсбек →
+    одна строка» и направить необработанные исключения в лог. full=None — взять из
+    LOG_TRACEBACKS. Возвращает, включены ли полные трейсбеки."""
+    filt = _CondenseTracebacks(tracebacks_from_env() if full is None else full)
+    for h in (handlers if handlers is not None else logging.getLogger().handlers):
+        h.addFilter(filt)
+    _install_excepthooks()
+    return filt.full
 
 
 def set_record(key):
@@ -94,7 +178,10 @@ def setup(log_dir, per_worker=True, level=logging.INFO):
     daemon.addFilter(filt)
     root.addHandler(daemon)
 
+    handlers = [console, daemon]
     if per_worker:
         pw = PerWorkerFileHandler(log_dir, fmt)
         pw.addFilter(filt)
         root.addHandler(pw)
+        handlers.append(pw)
+    condense_tracebacks(handlers)

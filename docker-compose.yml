@@ -1,6 +1,7 @@
-# Два сервиса на ОДНОМ образе:
+# Два сервиса на ОДНОМ образе + nginx перед ботом:
 #   talk-daemon — архивирует записи (ffmpeg + ASR + LLM + БД + удаление);
-#   talk-bot    — интерактивный бот Tag (кнопки/модалка/выдача файлов, алерты админам).
+#   talk-bot    — интерактивный бот Tag (кнопки/модалка/выдача файлов, алерты админам);
+#   talk-nginx  — HTTPS на 443: принимает нажатия кнопок от Tag и передаёт их боту.
 # Общие тома: data (SQLite-БД), Transcripts (файлы расшифровок), logs.
 # Первый прогон — с SEND_TO_TAG=0 в .env (наполнить архивы, никому не слать).
 
@@ -48,11 +49,23 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      # ЛЕВОЕ = BOT_HOST_PORT (свободный порт ХОСТА, напр. 8083), ПРАВОЕ = BUTTON_PORT
-      # (порт, который слушает бот ВНУТРИ контейнера). Оба берутся из .env.
-      # BOT_PUBLIC_URL в .env должен указывать на http://<host>:<BOT_HOST_PORT>.
-      - "${BOT_HOST_PORT:-8081}:${BUTTON_PORT:-8081}"
+      # Наружу бота не публикуем: нажатия от Tag приходят через talk-nginx (443). Этот порт —
+      # только для проверки с самой ВМ: curl http://127.0.0.1:${BOT_HOST_PORT}/health
+      - "127.0.0.1:${BOT_HOST_PORT:-8081}:${BUTTON_PORT:-8081}"
     volumes:
       - ./data:/app/data                 # та же БД, что у демона
       - ./Transcripts:/app/Transcripts   # те же файлы (бот отдаёт их в Tag)
       - ./logs:/app/logs
+
+  talk-nginx:
+    image: nginx:1.27-alpine
+    container_name: talk-nginx-nikiforov
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      - talk-bot
+    ports:
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/talk-bot.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
