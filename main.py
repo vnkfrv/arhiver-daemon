@@ -6,7 +6,8 @@ main.py — АВТОНОМНЫЙ ДЕМОН архивации записей Т
   1. ПОДХВАТ (когда открыто ASR-окно): заводим новые записи — все вплоть до конца
      прошлого дня (от старых к новым). Подхват создаёт только СТРОКУ в БД.
   2. ОБРАБОТКА: берём из БД записи, которым ПОРА (due_records по индексу), и обрабатываем
-     их ПАРАЛЛЕЛЬНО (RECORD_WORKERS воркеров, у каждого своя запись). Стадии гейтятся
+     их ПАРАЛЛЕЛЬНО (у каждого воркера своя запись; RECORD_WORKERS_ASR — на транскрибации,
+     RECORD_WORKERS_LLM — на LLM и пост-стадиях). Стадии гейтятся
      рабочими окнами: транскрибация — в ASR-окне, LLM (improve/summarize) и пост-стадии —
      в LLM-окне. Окно проверяется ПЕРЕД стартом записи; начатую доводим до конца.
   3. СЛУЖЕБНОЕ (после прохода и раз в минуту во время него): фаза единоразового
@@ -26,9 +27,12 @@ main.py — АВТОНОМНЫЙ ДЕМОН архивации записей Т
 """
 
 import argparse
+import json
 import logging
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +46,7 @@ import statuses
 import store
 import pipeline
 import notify
+import resources
 import texts
 from pipeline import Ctx
 from config import load_cfg
@@ -185,6 +190,7 @@ def _retry_short(ctx):
     ограничил частоту запросов на «горе» записей). Лестница пройдена — видео остаётся в
     Толке: ошибка видна в карточке записи, удалить его можно из админ-панели."""
     for row in db.short_retries(ctx.db, _now_iso()):
+        _beat()
         key = row["recording_key"]
         try:
             fields, what = _delete_short(ctx, key)
@@ -210,6 +216,7 @@ def _discover(ctx):
     since = db.max_created(ctx.db)
     discovered = shortdel = 0
     for meta in ctx.client.list(since=since, order="byTimeOldFirst"):
+        _beat()
         try:
             dt = _parse_dt(meta.get("createdDate"))
             if dt is None:
@@ -272,15 +279,357 @@ def _process_one(base_ctx, key, do_asr, do_llm):
 _cooldown = {}
 
 
+# --- СТОРОЖЕВОЙ ТАЙМЕР ------------------------------------------------------------
+# Главный цикл отмечается (_beat) на каждом шаге и внутри всех долгих циклов. Не отмечался
+# WATCHDOG_SEC — значит, завис (сетевые вызовы и БД ограничены таймаутами, так что это не
+# «долгая работа»): фоновый поток сообщает суперадмину и завершает процесс, Docker поднимает
+# демон заново — дальше всё продолжается с того места, что записано в БД.
+WATCHDOG_SEC = 2 * 3600
+_beat_at = time.monotonic()
+
+
+def _beat():
+    global _beat_at
+    _beat_at = time.monotonic()
+
+
+def _watchdog(ctx):
+    stale = time.monotonic() - _beat_at
+    if stale < WATCHDOG_SEC:
+        return
+    text = texts.ADMIN_WATCHDOG.format(mins=round(stale / 60))
+    try:
+        _notify_admins(ctx, text, only_super=True)      # синхронно: процесс сейчас завершится
+    finally:
+        logging.shutdown()
+        os._exit(1)
+
+
+# --- КОНТРОЛЬ ДИСКА И ОЗУ -------------------------------------------------------
+# Скачанный для расшифровки звук лежит на диске до конца попытки; забитый диск роняет все
+# попытки разом (Errno 28), и записи за сутки проходят всю лестницу повторов впустую. ОЗУ
+# съедают в основном расшифровки (ffmpeg, куски звука) — при нехватке ВМ встаёт целиком.
+_TMP_PREFIXES = resources.TMP_PREFIXES
+_TMP_STALE_SEC = 6 * 3600          # на утренней проверке: временная папка старше — точно остаток
+_DISK_RESUME_GAP = 2                # продолжаем, когда занятость диска ниже порога на столько %
+_RAM_RESUME_GAP = 5                 # тревога ОЗУ снимается ниже порога на столько %
+_ALERT_EVERY = 6 * 3600             # одна и та же тревога — не чаще (сек), если «мигает»
+_res_lock = threading.Lock()        # состояние ниже меняют диспетчер и фоновый поток
+_disk_paused = False                # новые расшифровки сейчас на паузе из-за диска
+_ram_high = False                   # ОЗУ сейчас выше порога тревоги
+_alert_at = {}                      # вид тревоги -> монотонное время последней отправки
+STATE_META = "daemon_state"         # meta: снимок состояния для кнопки «Память» в боте
+
+
+def _disk_used_pct(cfg):
+    return resources.disk(cfg)[0]
+
+
+def _alert_super(ctx, kind, text):
+    """Тревога суперадмину — в фоне (сеть Tag не должна задерживать раздачу записей) и не
+    чаще раза в _ALERT_EVERY на вид; чаще — только в лог."""
+    now = time.monotonic()
+    if kind in _alert_at and now - _alert_at[kind] < _ALERT_EVERY:
+        log.error(text)
+        return
+    _alert_at[kind] = now
+    threading.Thread(target=_notify_admins, kwargs=dict(ctx=ctx, text=text, only_super=True),
+                     name="alert", daemon=True).start()
+
+
+def _asr_allowed(ctx):
+    """Можно ли начинать новые расшифровки: диск занят меньше DISK_MAX_USED_PCT. Начатые
+    доводим, LLM и пост-стадии идут как обычно. Пауза снимается, когда занятость опустится
+    ниже порога на _DISK_RESUME_GAP (чтобы не «мигать» на границе). О паузе — суперадмину."""
+    global _disk_paused
+    limit = ctx.cfg.disk_max_used_pct
+    if not limit:
+        return True
+    pct = _disk_used_pct(ctx.cfg)
+    resume = max(0, limit - _DISK_RESUME_GAP)
+    with _res_lock:
+        if not _disk_paused and pct >= limit:
+            _disk_paused = True
+            _alert_super(ctx, "disk", texts.ADMIN_DISK_FULL.format(
+                pct=round(pct), limit=limit, resume=resume))
+        elif _disk_paused and pct < resume:
+            _disk_paused = False
+            log.warning("диск занят на %d%% (ниже %d%%) — новые расшифровки возобновлены",
+                        round(pct), resume)
+        return not _disk_paused
+
+
+def _ram_check(ctx):
+    """Тревога суперадмину, когда ОЗУ ВМ занята от RAM_ALERT_PCT; снимается ниже порога на
+    _RAM_RESUME_GAP. Возвращает текущие цифры ОЗУ (или None, если узнать нельзя)."""
+    global _ram_high
+    r = resources.ram()
+    limit = ctx.cfg.ram_alert_pct
+    if not (r and limit):
+        return r
+    with _res_lock:
+        if not _ram_high and r["used_pct"] >= limit:
+            _ram_high = True
+            _alert_super(ctx, "ram", texts.ADMIN_RAM_HIGH.format(
+                pct=round(r["used_pct"]), limit=limit, used=resources.gb(r["total"] - r["available"]),
+                total=resources.gb(r["total"]), swap=resources.gb(r["swap_used"]),
+                workers=ctx.cfg.record_workers_asr))
+        elif _ram_high and r["used_pct"] < limit - _RAM_RESUME_GAP:
+            _ram_high = False
+            log.warning("ОЗУ занята на %d%% — ниже порога тревоги", round(r["used_pct"]))
+    return r
+
+
+def _monitor(ctx):
+    """Раз в минуту (фоновый поток): диск и ОЗУ — с тревогами суперадмину, и снимок состояния
+    в meta для кнопки «Память» (бот в своём контейнере не видит временную папку демона)."""
+    _watchdog(ctx)
+    paused = not _asr_allowed(ctx)
+    r = _ram_check(ctx)
+    db.set_meta(ctx.db, STATE_META, json.dumps({
+        "at": _now_iso(), "asr_paused": paused, "tmp_dirs": resources.tmp_dirs(),
+        "ram_pct": round(r["used_pct"]) if r else None}))
+
+
+def _clean_tmp(min_age=0):
+    """Убрать временные папки расшифровки, оставшиеся от прерванных попыток. Их удаляет сама
+    попытка (в finally), но если процесс остановили или убили посреди неё, папка остаётся, а
+    в перезапущенном контейнере копится (однажды так набралось 330 ГБ). При старте демона
+    (воркеров ещё нет) — все; на утренней проверке — только старше min_age секунд: в это время
+    могут идти повторные расшифровки по просьбе участников, их папки трогать нельзя.
+    Возвращает (папок, байт)."""
+    tmp = tempfile.gettempdir()
+    old = time.time() - min_age
+    n = size = 0
+    for entry in os.scandir(tmp):
+        if not (entry.name.startswith(_TMP_PREFIXES) and entry.is_dir(follow_symlinks=False)):
+            continue
+        if min_age and entry.stat().st_mtime > old:
+            continue
+        _beat()
+        for root, _, files in os.walk(entry.path):
+            for f in files:
+                try:
+                    size += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        shutil.rmtree(entry.path, ignore_errors=True)
+        n += 1
+    if n:
+        log.warning("из %s убраны остатки прерванных расшифровок: папок %d, %.1f ГБ",
+                    tmp, n, size / 1024 ** 3)
+    return n, size
+
+
+# --- ПОВТОРНАЯ РАСШИФРОВКА ПО ПРОСЬБЕ УЧАСТНИКА ------------------------------------
+# Кнопка «Повторить расшифровку» (бот заводит запрос в redo_requests). Делаем сразу, вне рабочих
+# окон, — личную копию для этого человека: в архив она не пишется, запись и её файлы не меняются.
+# Файлы кладём в data/redo/<номер запроса> (папка общая с ботом); бот присылает их и удаляет.
+REDO_POLL_SEC = 10
+_REDO_KEEP_DAYS = 7                 # неотправленные (Tag недоступен неделю) — убрать
+
+
+def redo_dir(cfg, req_id=None):
+    base = os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "redo")
+    return base if req_id is None else os.path.join(base, str(req_id))
+
+
+def _redo_one(ctx, req):
+    """Расшифровать запись заново для одного человека. Возвращает (удалось, итог для него)."""
+    key = req["recording_key"]
+    row = db.get(ctx.db, key)
+    if row is None:
+        return False, texts.REDO_NOT_FOUND
+    if row.get("deleted") or row.get("text_cleaned"):
+        return False, texts.REDO_NO_VIDEO
+    out = redo_dir(ctx.cfg, req["id"])
+    shutil.rmtree(out, ignore_errors=True)       # остаток прерванной попытки этого же запроса
+    logsetup.set_record(key)
+    try:
+        _, llm_problem = pipeline.redo_transcript(replace(ctx, client=_worker_client()), row, out)
+    except Exception as ex:
+        shutil.rmtree(out, ignore_errors=True)
+        reason = _err(ex)
+        log.warning("повторная расшифровка %s не удалась: %s", key, reason)
+        if "404" in reason or "видео тоже нет" in reason:
+            return False, texts.REDO_NO_VIDEO
+        return False, texts.REDO_FAILED.format(reason=reason[:200])
+    finally:
+        logsetup.clear_record()
+    log.info("повторная расшифровка %s по просьбе участника готова%s", key,
+             f" (только базовая: {llm_problem})" if llm_problem else "")
+    return True, texts.REDO_PARTIAL if llm_problem else texts.REDO_DONE
+
+
+def _redo_run(ctx, req, slots):
+    try:
+        ok, message = _redo_one(ctx, req)
+    except Exception as ex:
+        ok, message = False, texts.REDO_FAILED.format(reason=_err(ex)[:200])
+        log.warning("повторная расшифровка %s сорвалась: %s", req["recording_key"], _err(ex))
+    finally:
+        slots.release()
+    db.redo_mark(ctx.db, req["id"], ok=ok, message=message)
+
+
+def _clean_redo(cfg):
+    """Папки повторных расшифровок, которые бот так и не отправил за _REDO_KEEP_DAYS, — убрать."""
+    base = redo_dir(cfg)
+    if not os.path.isdir(base):
+        return
+    old = time.time() - _REDO_KEEP_DAYS * 86400
+    for entry in os.scandir(base):
+        if entry.is_dir() and entry.stat().st_mtime < old:
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _redo_loop(ctx):
+    """Фоновый поток: раз в REDO_POLL_SEC берёт запросы «Повторить расшифровку» — в любое время
+    суток, не больше REDO_WORKERS одновременно. Ждёт, пока диск заполнен (пауза расшифровок)."""
+    n = db.redo_unstarted_after_restart(ctx.db)
+    if n:
+        log.info("повторных расшифровок, прерванных перезапуском, вернулось в очередь: %d", n)
+    slots = threading.Semaphore(ctx.cfg.redo_workers)
+    while True:
+        try:
+            if _asr_allowed(ctx):
+                for req in db.redo_waiting(ctx.db):
+                    if not slots.acquire(blocking=False):
+                        break                        # все заняты — остальные на следующем круге
+                    db.redo_mark(ctx.db, req["id"], started=True)
+                    log.info("повторная расшифровка %s по просьбе участника — начинаю",
+                             req["recording_key"])
+                    threading.Thread(target=_redo_run, args=(ctx, req, slots), name="redo",
+                                     daemon=True).start()
+        except Exception as ex:
+            log.warning("очередь повторных расшифровок: сбой: %s", _err(ex))
+        time.sleep(REDO_POLL_SEC)
+
+
+# --- УТРЕННЯЯ ПРОВЕРКА -------------------------------------------------------------
+_llm_ran = False                    # с прошлой проверки было открыто LLM-окно
+BACKUPS_KEEP = 7                    # ежедневных копий базы
+_PENDING_REPORT = "pending_morning_report"   # meta: утренний отчёт, не дошедший до Tag
+
+
+def _backup_db(cfg, conn):
+    """Копия базы на сегодня в data/backups (средствами SQLite — целостная, со свежими
+    изменениями из -wal) и проверка её целостности; храним BACKUPS_KEEP последних. База —
+    единственный источник правды о записях: испортится — восстановимся со вчерашней копии.
+    Возвращает (имя файла, итог проверки)."""
+    folder = os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "backups")
+    os.makedirs(folder, exist_ok=True)
+    name = f"recordings-{datetime.now():%Y-%m-%d}.db"
+    path = os.path.join(folder, name)
+    tmp = path + ".tmp"
+    db.backup_to(conn, tmp)
+    check = sqlite3.connect(tmp)
+    try:
+        result = check.execute("PRAGMA quick_check").fetchone()[0]
+    finally:
+        check.close()
+    os.replace(tmp, path)
+    copies = sorted(n for n in os.listdir(folder) if n.startswith("recordings-") and n.endswith(".db"))
+    for old in copies[:-BACKUPS_KEEP]:
+        os.remove(os.path.join(folder, old))
+    return name, result
+
+
+_pending_retry_at = 0.0
+
+
+def _send_pending_report(ctx):
+    """Утренний отчёт, который не дошёл (Tag был недоступен), — повторить из фонового потока
+    раз в полчаса, пока не уйдёт."""
+    global _pending_retry_at
+    if time.monotonic() < _pending_retry_at:
+        return
+    text = db.get_meta(ctx.db, _PENDING_REPORT)
+    if not text:
+        return
+    if _notify_admins(ctx, text, only_super=True, level=logging.DEBUG):
+        db.set_meta(ctx.db, _PENDING_REPORT, "")
+    else:
+        _pending_retry_at = time.monotonic() + 1800
+
+
+def _morning_check(ctx):
+    """После LLM-окна, когда воркеров нет: каждый файл, записанный с прошлой проверки (журнал
+    store), должен быть цел и кончаться проверочной фразой. Испорченные — в сторону, запись —
+    на переделку соответствующей стадии (не больше REDO_LIMIT разом: больше — скорее сбилась
+    сама проверка, тогда только сообщаем). Заодно убираем остатки во временной папке. Итог —
+    суперадмину каждый раз: «всё цело» тоже новость, а «за ночь ничего не записано» — тревога."""
+    cfg, conn = ctx.cfg, ctx.db
+    tmp_n, tmp_size = _clean_tmp(min_age=_TMP_STALE_SEC)
+    _clean_redo(cfg)
+    kinds_by_key = {}
+    for path in store.take_journal():
+        key, _, kind = os.path.basename(path)[:-3].rpartition("_")
+        kind = {"ASR": "asr", "LLM": "llm", "short": "short"}.get(kind)
+        if key and kind:
+            kinds_by_key.setdefault(key, set()).add(kind)
+    strict = pipeline.strict_files(conn)
+    bad = []
+    for key, kinds in kinds_by_key.items():
+        _beat()
+        row = db.get(conn, key)
+        if row is None or row.get("deleted") or row.get("text_cleaned"):
+            continue
+        broken = pipeline.broken_outputs(row, strict, always_strict=kinds)
+        if broken:
+            bad.append((row, broken))
+    fixed = len(bad) <= pipeline.REDO_LIMIT
+    if fixed:
+        for row, broken in bad:
+            pipeline.set_aside(row, broken)
+            db.update(conn, row["recording_key"], **pipeline.redo_fields(row, broken))
+    files = sum(len(k) for k in kinds_by_key.values())
+    parts = [texts.ADMIN_MORNING_HEAD.format(files=files, records=len(kinds_by_key))]
+    if not kinds_by_key:
+        parts.append(texts.ADMIN_MORNING_NOTHING)
+    elif not bad:
+        parts.append(texts.ADMIN_MORNING_OK)
+    else:
+        lines = "\n".join(f"• `{row['recording_key']}` — {pipeline.describe(broken)}"
+                          for row, broken in bad[:15])
+        more = f"\n… и ещё {len(bad) - 15}" if len(bad) > 15 else ""
+        parts.append((texts.ADMIN_MORNING_REDONE if fixed else texts.ADMIN_MORNING_TOO_MANY)
+                     .format(n=len(bad), limit=pipeline.REDO_LIMIT) + "\n" + lines + more)
+    if tmp_n:
+        parts.append(texts.ADMIN_MORNING_TMP.format(n=tmp_n, size=resources.gb(tmp_size)))
+    try:
+        name, result = _backup_db(cfg, conn)
+        parts.append(texts.ADMIN_MORNING_BACKUP.format(name=name) if result == "ok"
+                     else texts.ADMIN_MORNING_BACKUP_BAD.format(name=name, result=result[:300]))
+        bad_db = result != "ok"
+    except Exception as ex:
+        parts.append(texts.ADMIN_MORNING_BACKUP_FAIL.format(error=_err(ex)))
+        bad_db = True
+    pct, _, total, free = resources.disk(cfg)
+    r = resources.ram()
+    parts.append(texts.ADMIN_MORNING_RES.format(
+        disk=round(pct), free=resources.gb(free),
+        ram=f"{r['used_pct']:.0f}%" if r else "—"))
+    text = "\n".join(parts)
+    if not _notify_admins(ctx, text, only_super=True,
+                          level=logging.WARNING if bad or bad_db or not kinds_by_key else logging.INFO):
+        db.set_meta(conn, _PENDING_REPORT, text)        # Tag недоступен — отправим позже
+    store.done_journal()
+
+
+
 def _run_active(ctx):
     """Пока открыто хоть одно окно — обрабатывать записи НЕПРЕРЫВНО: воркеры НЕЗАВИСИМЫ,
     как только один освободился — сразу берёт следующую запись (не ждёт соседей). Держим
-    до record_workers записей одновременно. Окно проверяется ПЕРЕД стартом каждой записи;
-    начатую доводим до конца (do_asr/do_llm фиксируются при старте). Возвращает число
-    обработанных записей."""
+    до record_workers_asr записей на транскрибации и до record_workers_llm — на LLM и
+    пост-стадиях; слот выбирается по фазе записи при старте. Окно проверяется ПЕРЕД стартом
+    каждой записи; начатую доводим до конца (do_asr/do_llm фиксируются при старте) — если
+    окна пересекаются, запись из ASR-слота сразу проходит и LLM, не отдавая слот. Возвращает
+    число обработанных записей."""
+    global _llm_ran
     cfg = ctx.cfg
     llm_ok = bool(ctx.llm and ctx.llm.available())
-    inflight = set()  # ключи, что сейчас в работе (чтобы не выдать одну дважды)
+    inflight = {}  # ключ -> фаза ('asr'/'llm') записей в работе (чтобы не выдать одну дважды)
     lock = threading.Lock()
     stats = {"worked": 0}
 
@@ -321,53 +670,90 @@ def _run_active(ctx):
             # слот освобождаем В КОНЦЕ: к этому моменту передышка сорвавшейся записи уже
             # выставлена, и диспетчер не успеет выдать её повторно
             with lock:
-                inflight.discard(key)
+                inflight.pop(key, None)
 
     with ThreadPoolExecutor(
-        max_workers=cfg.record_workers, thread_name_prefix="rec"
+        max_workers=cfg.record_workers_asr + cfg.record_workers_llm, thread_name_prefix="rec"
     ) as pool:
-        while True:
-            _service(ctx, every=60)          # повторы рассылки не ждут конца долгого прохода
-            now = _local_now()
-            da = config.in_window(now, cfg.asr_window)  # True если окна нет
-            dl = config.in_window(now, cfg.llm_window)
-            if not (da or dl):
-                break  # все окна закрыты — новые не стартуем
-            with lock:
-                free = cfg.record_workers - len(inflight)
-                busy = len(inflight)
-                for k in [k for k, until in _cooldown.items() if until <= time.monotonic()]:
-                    del _cooldown[k]
-                resting = set(_cooldown)
-            if free <= 0:
-                time.sleep(0.2)  # все воркеры заняты — ждём слот
-                continue
-            # берём записи ТЕКУЩЕЙ фазы (фильтр в SQL — иначе старые llm-записи вытеснят
-            # свежие asr из-под limit и транскрибация «голодает»); с запасом на inflight.
-            phase = None if (da and dl) else ("asr" if da else "llm")
-            rows = db.due_records(
-                ctx.db, _now_iso(),
-                limit=free + busy + cfg.record_workers + len(resting), phase=phase
-            )
-            launched = 0
-            for r in rows:
-                if launched >= free:
-                    break
-                key = r["recording_key"]
-                if key in resting:
-                    continue             # обработка недавно сорвалась — даём передышку
+        try:
+            while True:
+                _beat()
+                _service(ctx, every=60)          # повторы рассылки не ждут конца долгого прохода
+                now = _local_now()
+                da = config.in_window(now, cfg.asr_window)  # True если окна нет
+                dl = config.in_window(now, cfg.llm_window)
+                if not (da or dl):
+                    break  # все окна закрыты — новые не стартуем
+                if dl:
+                    _llm_ran = True                # после LLM-окна будет утренняя проверка
+                # слоты фазы с закрытым окном — 0: новых записей этой фазы не берём (начатые доводим);
+                # то же для расшифровки, пока диск заполнен
+                caps = {"asr": cfg.record_workers_asr if da and _asr_allowed(ctx) else 0,
+                        "llm": cfg.record_workers_llm if dl else 0}
                 with lock:
-                    if key in inflight:
+                    busy = len(inflight)
+                    free = {p: caps[p] - sum(1 for q in inflight.values() if q == p) for p in caps}
+                    for k in [k for k, until in _cooldown.items() if until <= time.monotonic()]:
+                        del _cooldown[k]
+                    resting = set(_cooldown)
+                want = sum(n for n in free.values() if n > 0)
+                if not want:
+                    if not busy:
+                        break        # брать нельзя и ждать некого (расшифровка на паузе из-за
+                                     # диска, а LLM-окно закрыто) — до следующего прохода
+                    time.sleep(0.2)  # все воркеры открытых фаз заняты — ждём слот
+                    continue
+                # берём записи только тех фаз, где есть свободные слоты (фильтр в SQL — иначе записи
+                # занятой фазы вытеснят из-под limit записи свободной, и та «голодает»); с запасом
+                # на inflight.
+                # Записи каждой фазы — своим запросом: иначе записи одной фазы вытеснили бы из-под
+                # limit записи другой. Пока сервис какой-то стадии лежит (pipeline.OUTAGE), на неё
+                # пускаем только пробную запись раз в несколько минут, остальные ждут — без расхода
+                # попыток; выборку тогда берём с запасом, чтобы за ждущими нашлась другая работа.
+                down = pipeline.OUTAGE.down_stages()
+                ord_done = pipeline._old_records_done(ctx) if down else True
+                launched = 0
+                for ph in ("asr", "llm"):
+                    if free[ph] <= 0:
                         continue
-                    inflight.add(key)
-                pool.submit(_process_one, ctx, key, da, dl).add_done_callback(
-                    lambda f, k=key: _done(f, k)
-                )
-                launched += 1
-            if launched < free:  # свободной работы не хватило заполнить слоты
-                if busy == 0 and launched == 0:
-                    break  # и никто не в работе -> дел на сейчас нет
-                time.sleep(0.3)  # ждём завершения текущих (появятся слоты/работа)
+                    rows = db.due_records(
+                        ctx.db, _now_iso(), phase=ph,
+                        limit=free[ph] + busy + caps[ph] + len(resting) + (1000 if down else 0))
+                    for r in rows:
+                        if free[ph] <= 0:
+                            break
+                        key = r["recording_key"]
+                        if key in resting:
+                            continue             # обработка недавно сорвалась — даём передышку
+                        with lock:
+                            if key in inflight:
+                                continue
+                        if down:             # (после проверки «в работе»: пробу не тратим зря)
+                            pend = pipeline.stages_pending(r, cfg, llm_ok, bool(r.get("protected")),
+                                                           old_records_done=ord_done)
+                            if pend and not pipeline.OUTAGE.may_start(pend[0]):
+                                continue         # сервис этой стадии лежит, пробная уже ушла
+                        with lock:
+                            inflight[key] = ph   # добавляет только этот поток — гонки нет
+                        free[ph] -= 1
+                        pool.submit(_process_one, ctx, key, da, dl).add_done_callback(
+                            lambda f, k=key: _done(f, k)
+                        )
+                        launched += 1
+                if launched < want:  # свободной работы не хватило заполнить слоты
+                    if busy == 0 and launched == 0:
+                        break  # и никто не в работе -> дел на сейчас нет
+                    time.sleep(0.3)  # ждём завершения текущих (появятся слоты/работа)
+        finally:
+            # окна закрылись, дел нет или цикл прервала ошибка — доводим начатые; ждём здесь, а
+            # не в выходе из with (тот ждёт молча, и сторожевой таймер принял бы долгую
+            # расшифровку за зависание)
+            while True:
+                with lock:
+                    if not inflight:
+                        break
+                _beat()
+                time.sleep(1)
     return stats["worked"]
 
 
@@ -375,18 +761,20 @@ def _run_active(ctx):
 _alert_mm = None            # ленивый MM-клиент только для алертов (даже при SEND_TO_TAG=0)
 
 
-def _notify_admins(ctx, text, buttons=False):
-    """Написать всем админам в Tag (+ всегда в лог ERROR) — от имени АДМИН-БОТА (если его
-    токен не задан, от основного). MM-клиент строим лениво и отдельно от рассылки
+def _notify_admins(ctx, text, buttons=False, only_super=False, level=logging.ERROR):
+    """Написать всем админам в Tag (+ всегда в лог с уровнем level) — от имени АДМИН-БОТА
+    (если его токен не задан, от основного). MM-клиент строим лениво и отдельно от рассылки
     участникам, чтобы сообщение уходило даже при SEND_TO_TAG=0.
     buttons=True — приложить кнопки «перезапустить остановленные» / «админ-панель».
+    only_super=True — только суперадмину (состояние ВМ, утренняя проверка); его нет — всем.
     Возвращает False, если Tag настроен, но сообщение не дошло ни до одного админа
     (стоит повторить позже); True — доставлено либо слать некуда (Tag не настроен)."""
-    log.error(text)
+    log.log(level, text)
     cfg = ctx.cfg
     if not (cfg.mm.url and (cfg.mm.admin_bot_token or cfg.mm.bot_token)):
         return True
-    admins = db.list_admins(ctx.db)
+    sup = db.superadmin(ctx.db) if only_super else None
+    admins = [sup] if sup else db.list_admins(ctx.db)
     if not admins:
         log.error("в БД нет админов — некому слать алерт (задай ADMIN_USERNAME и запусти бота)")
         return False
@@ -465,13 +853,21 @@ def _admin_report(ctx, now=None):
 
 
 def _report_loop(ctx):
-    """Фоновый поток сводки. Отдельный от главного цикла: в час сводки демон обычно спит
-    между рабочими окнами либо часами без перерыва разбирает очередь."""
+    """Фоновый поток: суточная сводка и раз в минуту — диск и ОЗУ (_monitor). Отдельный от
+    главного цикла: демон то спит между окнами, то часами без перерыва разбирает очередь."""
     while True:
         try:
             _admin_report(ctx)
         except Exception as ex:
             log.warning("сводка админам: сбой: %s", _err(ex))
+        try:
+            _monitor(ctx)
+        except Exception as ex:
+            log.warning("проверка диска и ОЗУ: сбой: %s", _err(ex))
+        try:
+            _send_pending_report(ctx)
+        except Exception as ex:
+            log.warning("повтор утреннего отчёта: сбой: %s", _err(ex))
         time.sleep(60)
 
 
@@ -630,7 +1026,8 @@ def tick(ctx):
     now = _local_now()
     asr_on = (not cfg.asr_window) or config.in_window(now, cfg.asr_window)
     log.info(
-        "=== тик [REAL_DELETE=%d]: LLM=%s, ASR-окно=%s, LLM-окно=%s, воркеров=%d ===",
+        "=== тик [REAL_DELETE=%d]: LLM=%s, ASR-окно=%s, LLM-окно=%s, воркеров ASR/LLM=%d/%d, "
+        "диск занят %d%%%s ===",
         int(cfg.real_delete),
         "вкл" if llm_ok else "выкл",
         "откр" if asr_on else "закр",
@@ -639,7 +1036,10 @@ def tick(ctx):
             if ((not cfg.llm_window) or config.in_window(now, cfg.llm_window))
             else "закр"
         ),
-        cfg.record_workers,
+        cfg.record_workers_asr,
+        cfg.record_workers_llm,
+        round(_disk_used_pct(cfg)),
+        " (расшифровки на паузе)" if _disk_paused else "",
     )
     # Подхват и обработка — в РАЗДЕЛЬНЫХ try: сбой discovery (напр. Talk недоступен) не
     # должен ни ронять демон гигантским трейсбеком, ни мешать обработке уже заведённых.
@@ -681,6 +1081,21 @@ def _build_mm(cfg):
     return mm
 
 
+def _check_db_matches_archive(cfg, conn):
+    """База пустая, а в Transcripts уже есть расшифровки — почти наверняка DB_PATH указывает не
+    туда (или базу удалили, а тексты оставили). Работать так нельзя: демон завёл бы все записи
+    заново и перерасшифровал бы весь архив, перезаписывая готовые файлы. Останавливаемся с
+    понятной причиной (Docker будет перезапускать — в логе каждый раз та же подсказка)."""
+    if db.has_records(conn):
+        return
+    for _, _, files in os.walk(cfg.out_dir):
+        if any(f.endswith(".md") for f in files):
+            raise SystemExit(
+                f"[!] База {cfg.db_path} пуста, а в {cfg.out_dir} уже есть расшифровки. Похоже, "
+                f"DB_PATH указывает не на ту базу. Проверь DB_PATH и том data. Если базу удалили "
+                f"намеренно и архив нужно собрать заново — сначала переименуй папку Transcripts.")
+
+
 def build_ctx():
     cfg = load_cfg()
     conn = db.connect(cfg.db_path)
@@ -697,19 +1112,29 @@ def main():
     )
     args = ap.parse_args()
 
+    global _llm_ran
     logsetup.setup(LOG_DIR)
     ctx = build_ctx()
     cfg = ctx.cfg
+    _check_db_matches_archive(cfg, ctx.db)
+    # тревоги пайплайна (сервис стадии лёг/поднялся, сработал предохранитель самопроверки)
+    pipeline.alert = lambda kind, text: _alert_super(ctx, kind, text)
+    # журнал записанных файлов — рядом с базой (переживает пересоздание контейнера)
+    store.set_journal(os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "written.journal"))
     log.info(
         "старт демона: REAL_DELETE=%d, SEND_TO_TAG=%d, SEND_TO_MAIL=%d, out_dir=%s, db=%s, "
-        "ASR-окно=%s, LLM-окно=%s, воркеров=%d, повторы стадии (от первой ошибки) через %s, "
-        "сводка админам в %02d:%02d",
+        "ASR-окно=%s, LLM-окно=%s, воркеров ASR/LLM=%d/%d, пауза расшифровок при диске от %s, "
+        "тревога ОЗУ от %s, "
+        "повторы стадии (от первой ошибки) через %s, сводка админам в %02d:%02d",
         int(cfg.real_delete), int(cfg.send_to_tag), int(cfg.send_to_mail),
         cfg.out_dir,
         cfg.db_path,
         cfg.asr_window,
         cfg.llm_window,
-        cfg.record_workers,
+        cfg.record_workers_asr,
+        cfg.record_workers_llm,
+        f"{cfg.disk_max_used_pct}%" if cfg.disk_max_used_pct else "— (контроль выключен)",
+        f"{cfg.ram_alert_pct}%" if cfg.ram_alert_pct else "— (выключена)",
         ", ".join(pipeline._fmt_delay(d) for d in cfg.retry_delays_sec),
         *cfg.admin_report_time,
     )
@@ -722,9 +1147,18 @@ def main():
 
     if not args.once:                      # суточная сводка админам — своим потоком
         threading.Thread(target=_report_loop, args=(ctx,), name="admin-report", daemon=True).start()
+        # Только в режиме демона: разовые --once/--record запускают рядом с работающим демоном
+        # (docker compose exec), и его папки в работе удалять нельзя.
+        try:
+            _clean_tmp()
+        except Exception as ex:
+            log.warning("не удалось убрать остатки прошлого запуска из временной папки: %s", _err(ex))
+        # повторные расшифровки по просьбе участников — сразу, вне рабочих окон
+        threading.Thread(target=_redo_loop, args=(ctx,), name="redo-queue", daemon=True).start()
 
     idle = False                           # уже сообщили в лог, что ждём открытия окна
     while True:
+        _beat()
         # вне всех рабочих окон — записи не обрабатываем (--once игнорирует окна). Но спим
         # не одним куском до открытия, а по 5 минут: служебные дела (повторы единоразовой
         # рассылки по лестнице) должны идти в срок и вне окон.
@@ -738,6 +1172,12 @@ def main():
                 _service(ctx, every=60)
             except Exception as ex:        # служебные дела не должны ронять главный цикл
                 log.warning("служебный проход вне окон не удался: %s", _err(ex))
+            if _llm_ran:                   # LLM-окно закрылось и все записи доделаны
+                _llm_ran = False           # (сбой проверки не повторяем по кругу: журнал
+                try:                       #  сохранится до следующей)
+                    _morning_check(ctx)
+                except Exception as ex:
+                    log.warning("утренняя проверка не удалась: %s", _err(ex))
             time.sleep(min(s, 300.0))
             continue
         idle = False

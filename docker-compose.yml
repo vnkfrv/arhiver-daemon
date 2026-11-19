@@ -19,6 +19,9 @@ services:
     image: talk-archiver-nikiforov:latest
     container_name: talk-daemon-nikiforov
     restart: unless-stopped
+    # init: процесс-«няня» вместо python в роли PID 1: сигналы остановки доходят до python
+    # сразу (а не через 10 с SIGKILL), осиротевшие ffmpeg не копятся зомби
+    init: true
     logging: *logging
     env_file:
       - .env
@@ -32,6 +35,7 @@ services:
     image: talk-archiver-nikiforov:latest   # тот же образ, что собрал talk-daemon
     container_name: talk-bot-nikiforov
     restart: unless-stopped
+    init: true
     logging: *logging
     env_file:
       - .env

@@ -143,7 +143,7 @@ class MagnitASR:
                                    + (" | ".join(tail) or f"код {ex.returncode}")) from None
             chunks = sorted(glob.glob(os.path.join(work, "chunk_*.wav")))  # sorted => по порядку 00000,00001
             # Куски дорожки шлём в ASR ПОСЛЕДОВАТЕЛЬНО (частота под лимитером внутри _call).
-            # Параллелизм — на уровне ЗАПИСЕЙ: RECORD_WORKERS воркеров обрабатывают разные
+            # Параллелизм — на уровне ЗАПИСЕЙ: RECORD_WORKERS_ASR воркеров обрабатывают разные
             # записи одновременно (это и есть число одновременных запросов к шлюзу).
             words = []
             for i, ch in enumerate(chunks):

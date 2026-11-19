@@ -8,6 +8,8 @@ store.py — ФАЙЛОВОЕ ХРАНИЛИЩЕ выходных файлов �
         <ID>_LLM.md           # LLM-обработанная расшифровка (чистка терминологии/вид стенограммы)
         <ID>_short.md         # короткая выжимка (LLM)
 Шапка (Название/Дата/Длительность/Участники) добавляется в начало _ASR.md и _LLM.md.
+Каждый готовый файл пишется атомарно (временный файл + подмена) и кончается проверочной
+фразой MARKER — по ней проверяется, что файл записан целиком (problem).
 
 Папка записи (rec_dir) вычисляется из даты + ключа (store.rec_dir) и хранится в БД
 (recordings.rec_dir). Промежуточных файлов нет — вся память пайплайна в БД, на диске
@@ -17,9 +19,23 @@ store.py — ФАЙЛОВОЕ ХРАНИЛИЩЕ выходных файлов �
 
 import os
 import shutil
+import threading
 
 from talk_api import hhmmss
 from util import parse_dt as _parse_dt
+
+# Проверочная фраза — последняя строка КАЖДОГО готового файла (_ASR, _LLM, _short): по ней
+# видно, что файл записан целиком. При чтении она снимается, поэтому LLM, выжимка и повторное
+# сохранение её не видят и не задваивают. Пользователь видит её последней строкой файла.
+MARKER = "Транскрибация видеоконференции завершена."
+# Отметка в meta: фраза перенесена во все старые целые файлы (fix_broken_md.py --apply) —
+# с этого момента файл без фразы считается неполным.
+MARKER_MIGRATED = "md_marker_migrated"
+
+# Журнал записанных файлов (пути, по строке) — по нему утренняя проверка смотрит всё, что
+# записано с прошлой проверки. Включает демон (set_journal); бот и скрипты пишут без журнала.
+_journal_path = None
+_journal_lock = threading.Lock()
 
 
 def rec_dir(base, key, created_date):
@@ -77,17 +93,130 @@ def strip_header(md):
     return t
 
 
+def strip_marker(text):
+    """Текст файла без проверочной фразы в конце (и без хвостовых пробелов)."""
+    t = text.rstrip()
+    return t[:-len(MARKER)].rstrip() if t.endswith(MARKER) else t
+
+
+def _fsync_dir(d):
+    """Сбросить на диск саму папку — чтобы подмена файла пережила и внезапное выключение."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _write(path, md):
+    """Записать готовый файл АТОМАРНО и с проверкой: текст и проверочная фраза пишутся во
+    временный файл рядом, сбрасываются на диск, перечитываются и сверяются байт в байт — и
+    только потом одной операцией подменяют прежний. Кончилось место или процесс убили посреди
+    записи — на диске остаётся прежняя целая версия, а не обнулённый или обрезанный файл."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:    # кодировка явно: не зависим от локали хоста
-        f.write(md.rstrip() + "\n")
+    data = (strip_marker(md) + "\n\n" + MARKER + "\n").encode("utf-8")
+    tmp = path + ".tmp"                  # запись одной записи ведёт один воркер — имя не делится
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(tmp, "rb") as f:
+            if f.read() != data:
+                raise OSError(f"{os.path.basename(path)}: записанное не совпало с прочитанным")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(os.path.dirname(path))
+    _journal(path)
 
 
 def _read(path):
+    """Текст файла без проверочной фразы (None — файла нет)."""
     if not os.path.exists(path):
         return None
-    with open(path, encoding="utf-8") as f:
-        return f.read()
+    with open(path, encoding="utf-8") as f:   # кодировка явно: не зависим от локали хоста
+        return strip_marker(f.read())
+
+
+def problem(path, strict=True):
+    """Что не так с готовым файлом; None — файл цел. Читает файл целиком: пустой, битый
+    посреди буквы, без текста под шапкой — неполный. strict — обязательна проверочная фраза;
+    иначе файл без неё (записанный до появления фразы) считается целым, если кончается ровно
+    так, как архиватор всегда дописывал файлы: текст и один перевод строки."""
+    if not os.path.exists(path):
+        return "нет файла"
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "обрезан посреди буквы"
+    if not text.strip():
+        return "пустой"
+    if text.rstrip().endswith(MARKER):
+        body = strip_marker(text)
+    elif strict:
+        return "нет проверочной фразы"
+    elif not text.endswith("\n") or text[-2].isspace():
+        return "обрезан (нет конца файла)"
+    else:
+        body = text
+    if not strip_header(body).strip():
+        return "только шапка, текста нет"
+    return None
+
+
+# ---- журнал записанных файлов (для утренней проверки) -----------------------
+
+def set_journal(path):
+    """Включить журнал: каждый записанный файл дописывается строкой в path."""
+    global _journal_path
+    _journal_path = path
+
+
+def _journal(path):
+    if not _journal_path:
+        return
+    with _journal_lock, open(_journal_path, "a", encoding="utf-8") as f:
+        f.write(path + "\n")
+
+
+def take_journal():
+    """Забрать журнал на проверку: он переименовывается (новые записи пойдут в свежий файл), а
+    недоразобранный остаток прошлой проверки подхватывается. Возвращает множество путей."""
+    if not _journal_path:
+        return set()
+    checking = _journal_path + ".checking"
+    with _journal_lock:
+        if os.path.exists(_journal_path):
+            if os.path.exists(checking):
+                with open(_journal_path, encoding="utf-8") as src, \
+                        open(checking, "a", encoding="utf-8") as dst:
+                    dst.write(src.read())
+                os.remove(_journal_path)
+            else:
+                os.replace(_journal_path, checking)
+    if not os.path.exists(checking):
+        return set()
+    with open(checking, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def done_journal():
+    """Проверка по журналу закончена — разобранную часть удалить."""
+    if _journal_path:
+        try:
+            os.remove(_journal_path + ".checking")
+        except FileNotFoundError:
+            pass
 
 
 def write_asr_md(rd, key, md):

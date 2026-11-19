@@ -43,7 +43,7 @@ nano .env    # заполнить реальными значениями
 ```
 Обязательно: `TALK_BASE_URL`/`TALK_API_TOKEN`; `MAGNITGPT_*` (ASR) и `MAGNITGPT_LLM_*` (LLM);
 флаги `REAL_DELETE`/`SEND_TO_TAG`/`SEND_TO_MAIL`; окна `TIME_START_ASR/END_ASR`, `TIME_START_LLM/END_LLM`;
-`TZ` (если окна — по Москве); `RECORD_WORKERS`;
+`TZ` (если окна — по Москве); `RECORD_WORKERS_ASR`/`RECORD_WORKERS_LLM`;
 `MIN_DURATION`; Tag-блок (`URL`/`PORT`/`BOT_TOKEN`/`BOT_PUBLIC_URL`/`BUTTON_PORT`/
 `BUTTON_SECRET`); `ADMIN_USERNAME`.
 **На первый прогон — `REAL_DELETE=0`, `SEND_TO_TAG=0`, `SEND_TO_MAIL=0`** (наполнить архивы,
@@ -121,7 +121,27 @@ docker compose exec talk-daemon python main.py --once   # разовый про�
 - **Бэкап:** `./data/recordings.db` (витрина/планировщик), `./Transcripts/` (тексты).
 - **Тома — вместе.** База и `Transcripts` должны переезжать парой. Если тексты не смонтированы,
   демон видео не удалит: стадия упадёт с «расшифровки нет на диске» и попадёт в сводку админам.
-- **Скорость:** поднимай `RECORD_WORKERS`, если шлюз тянет (следи за 429/5xx в логах).
+- **Скорость:** поднимай `RECORD_WORKERS_LLM`, если шлюз тянет (следи за 429/5xx в логах);
+  `RECORD_WORKERS_ASR` — по ОЗУ и диску ВМ (каждый ASR-воркер держит скачанные файлы и ffmpeg).
+- **Диск и ОЗУ:** при заполненности диска от `DISK_MAX_USED_PCT` (по умолчанию 90%) новые
+  расшифровки встают на паузу; при ОЗУ от `RAM_ALERT_PCT` (80%) — тревога. Обе — суперадмину.
+  Состояние сейчас — кнопка «💾 Память» в админ-панели или `check_env.py`.
+- **Проверочная фраза в старых файлах** (один раз после обновления, демон остановлен):
+  `docker compose run --rm --no-deps -T --name fix-md talk-daemon python - < fix_broken_md.py`
+  (отчёт), затем то же с `--apply`.
+- **Перезапуск демона** — `docker compose up -d --force-recreate talk-daemon` (не `restart`: тот
+  не перечитывает `.env`).
+- **Автозапуск после перезагрузки ВМ** — контейнеры поднимает Docker, если он сам включён в
+  автозагрузку: `systemctl is-enabled docker` должно ответить `enabled` (иначе
+  `sudo systemctl enable docker`). Контейнер, остановленный вручную (`docker compose stop`), после
+  перезагрузки останется остановленным — так работает `restart: unless-stopped`.
+- **Копии базы** — каждое утро в `data/backups/recordings-ГГГГ-ММ-ДД.db` (7 последних, с проверкой
+  целостности). Восстановление: `docker compose stop talk-daemon talk-bot`, затем
+  `cp data/backups/<копия>.db data/recordings.db && rm -f data/recordings.db-wal data/recordings.db-shm`
+  (копия уже содержит всё нужное), затем `docker compose up -d`. Что изменилось после копии,
+  демон наверстает сам: записи, обработанные позже, пройдут стадии заново (файлы перезапишутся
+  целиком), новые записи подхватятся снова, а видео, удалённые за это время, он увидит как уже
+  удалённые в Толке.
 - **Сводка админам:** раз в сутки (`ADMIN_REPORT_TIME`, по умолчанию 9:00) демон пишет админам в
   Tag, сколько записей за сутки встало в ожидание админа (статусы `FAILED_…`) и на каких стадиях;
   если таких нет — молчит. Нужны `ADMIN_USERNAME` и Tag-блок в `.env`; уходит даже при `SEND_TO_TAG=0`. Кнопки в

@@ -66,7 +66,11 @@ class Cfg:
     admin_username: str     # bootstrap-админ (заносится в таблицу admins при старте)
     asr_window: tuple       # окно транскрибации ((ч,м),(ч,м)) — ОБЯЗАТЕЛЬНО
     llm_window: tuple       # окно LLM-обработки (improve/summarize/…) — ОБЯЗАТЕЛЬНО
-    record_workers: int     # сколько записей обрабатывать параллельно (воркеров)
+    record_workers_asr: int  # сколько записей одновременно на транскрибации (тяжёлое: файлы, ffmpeg)
+    record_workers_llm: int  # сколько — на LLM и пост-стадиях (лёгкое: воркер ждёт ответа)
+    disk_max_used_pct: int   # диск занят на столько % и больше -> новые расшифровки на паузе; 0 — без контроля
+    ram_alert_pct: int       # ОЗУ ВМ занята на столько % и больше -> тревога суперадмину; 0 — без контроля
+    redo_workers: int        # сколько повторных расшифровок по просьбе участников одновременно
     mm: MMCfg = field(default_factory=MMCfg)
 
 
@@ -214,6 +218,13 @@ def load_cfg():
     common = _time(env, "TIME_START"), _time(env, "TIME_END")
     asr_window = _window(env, "ASR", *common)
     llm_window = _window(env, "LLM", *common)
+    # Воркеры — раздельно на фазы: транскрибация держит скачанный звук на диске и куски в
+    # памяти, а LLM-воркер лишь ждёт ответа. Не заданы — обе из общего RECORD_WORKERS.
+    workers = env_int(env, "RECORD_WORKERS", 4, minimum=1)
+    # Порог заполненности диска (%, как в df): скачанный для расшифровки звук лежит на диске,
+    # и забитый диск роняет все попытки разом. 0 или 100 и больше — контроль выключен.
+    disk_max = env_int(env, "DISK_MAX_USED_PCT", 90, minimum=0)
+    ram_alert = env_int(env, "RAM_ALERT_PCT", 80, minimum=0)    # то же для ОЗУ (только тревога)
     missing = [n for n, w in (("ASR", asr_window), ("LLM", llm_window)) if not w]
     if missing:
         raise SystemExit(
@@ -243,6 +254,10 @@ def load_cfg():
         admin_username=(env.get("ADMIN_USERNAME") or "").strip().lstrip("@").lower(),
         asr_window=asr_window,
         llm_window=llm_window,
-        record_workers=max(1, env_int(env, "RECORD_WORKERS", 4)),
+        record_workers_asr=env_int(env, "RECORD_WORKERS_ASR", workers, minimum=1),
+        record_workers_llm=env_int(env, "RECORD_WORKERS_LLM", workers, minimum=1),
+        disk_max_used_pct=disk_max if disk_max < 100 else 0,
+        ram_alert_pct=ram_alert if ram_alert < 100 else 0,
+        redo_workers=env_int(env, "REDO_WORKERS", 2, minimum=1),
         mm=_load_mm(env),
     )

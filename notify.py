@@ -109,7 +109,7 @@ class NotifyResult:
 
 def send_archive_notifications(participants, *, title, date_str, minutes, delete_dt_str,
                                recording_key, mm=None, tag_enabled=False, send_mail=False,
-                               tag_done=None, mail_done=None):
+                               tag_done=None, mail_done=None, on_sent=None):
     """
     Разослать уведомления участникам записи. ИДЕМПОТЕНТНО по каждому каналу: кому уже
     доставлено в Tag (tag_done) или письмом (mail_done) — повторно не шлём, так что при
@@ -124,7 +124,13 @@ def send_archive_notifications(participants, *, title, date_str, minutes, delete
     тогда в самом уведомлении можно назвать тех, кто его не получит.
 
     participants — [{"name":..., "email":...}]. Возвращает NotifyResult.
+    on_sent(канал «tag»/«mail», ник) — сразу после каждой доставки: вызывающий отмечает её в БД,
+    и если процесс упадёт посреди рассылки, при повторе уже получившим не придёт дубль.
     """
+    def delivered(channel, username):
+        if on_sent:
+            on_sent(channel, username)
+
     tag_done, mail_done = set(tag_done or []), set(mail_done or [])
     subject = _mail_subject(title, date_str)
 
@@ -185,6 +191,7 @@ def send_archive_notifications(participants, *, title, date_str, minutes, delete
                             person["email"], _err(ex))
             if sent:
                 mail_sent.append(person["username"])
+                delivered("mail", person["username"])
             else:
                 failed(person, True, "почта не отправлена")
     mailed = mail_done | set(mail_sent) if send_mail else set()
@@ -203,10 +210,12 @@ def send_archive_notifications(participants, *, title, date_str, minutes, delete
             log.info("  [notify:ЗАГЛУШКА Tag] -> @%s (%s) по записи %s\n%s",
                      u, person["email"], recording_key, text)
             tag_sent.append(u)
+            delivered("tag", u)
         elif u in channels:
             try:
                 mm.post_archive(channels[u], text, recording_key)
                 tag_sent.append(u)
+                delivered("tag", u)
                 log.info("  [notify] Tag: уведомление об удалении записи %s отправлено @%s",
                          recording_key, u)
             except Exception as ex:

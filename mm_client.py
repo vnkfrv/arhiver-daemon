@@ -33,7 +33,7 @@ import requests
 import urllib3
 
 # Лейблы кнопок и варианты скачивания — в texts.py (единый источник строк).
-from texts import BTN_DOWNLOAD, BTN_ADMIN_PANEL, BTN_ADMIN_RESTART_ALL, FILE_ACTIONS
+from texts import BTN_DOWNLOAD, BTN_ADMIN_PANEL, BTN_ADMIN_RESTART_ALL, BTN_REDO, FILE_ACTIONS
 
 
 class UserUnavailable(Exception):
@@ -238,12 +238,15 @@ class MMClient:
         """Отправить файл В ВЕТКУ (root_id) с опциональным текстом."""
         return self.post_files(channel_id, [file_path], message=message, root_id=root_id)
 
-    def post_files(self, channel_id, file_paths, message="", root_id=None):
-        """Отправить НЕСКОЛЬКО файлов одним постом В ВЕТКУ (для действия «Всё»)."""
+    def post_files(self, channel_id, file_paths, message="", root_id=None, props=None):
+        """Отправить НЕСКОЛЬКО файлов одним постом В ВЕТКУ (для действия «Всё»); props — вложения
+        с кнопками под файлами."""
         file_ids = [self.upload_file(channel_id, p) for p in file_paths]
         payload = {"channel_id": channel_id, "message": message, "file_ids": file_ids}
         if root_id:
             payload["root_id"] = root_id
+        if props:
+            payload["props"] = props
         return self._post("/posts", payload)
 
     # ---- модальные диалоги ----
@@ -253,7 +256,9 @@ class MMClient:
 
     # ---- кнопки/вложения ----
     def action_url(self):
-        return f"{self.public_url}/action" + (f"?t={self.secret}" if self.secret else "")
+        # секрет кодируем: «#», «&», «+», «%» или пробел в нём иначе обрезали бы или исказили
+        # адрес, и Tag присылал бы нажатия с неверным секретом (401 — «ошибка интеграции»)
+        return f"{self.public_url}/action" + (f"?t={quote(self.secret, safe='')}" if self.secret else "")
 
     def dialog_url(self):
         return f"{self.public_url}/dialog" + (f"?t={self.dialog_token}" if self.dialog_token else "")
@@ -285,10 +290,16 @@ class MMClient:
         """Кнопки скачивания текстов записи (Базовая/Улучшенная/Краткая/Всё)."""
         return [self.button(label, val, key=recording_key) for val, label in FILE_ACTIONS]
 
+    def redo_button(self, recording_key):
+        """«Повторить расшифровку» — только пока видео в Толке (расшифровывать больше не из чего)."""
+        return self.button(BTN_REDO, "redo", key=recording_key)
+
     def archive_attachment(self, text, recording_key):
         """Вложение per-record уведомления: текст + кнопки скачивания текста
-        (Базовая/Улучшенная расшифровка, Краткая выжимка, Всё). Видео — из Talk напрямую."""
-        return [{"text": text, "actions": self.file_buttons(recording_key)}]
+        (Базовая/Улучшенная расшифровка, Краткая выжимка, Всё) и «Повторить расшифровку» —
+        уведомление уходит, пока видео ещё в Толке (до его удаления по графику)."""
+        return [{"text": text,
+                 "actions": self.file_buttons(recording_key) + [self.redo_button(recording_key)]}]
 
     def old_records_attachment(self, text):
         """Вложение единоразового old-records уведомления: текст + кнопка «Скачать запись».

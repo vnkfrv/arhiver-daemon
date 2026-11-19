@@ -133,6 +133,24 @@ CREATE TABLE IF NOT EXISTS admin_requests (
     note         TEXT
 );
 
+-- Запросы участников «Повторить расшифровку» (кнопка в карточке записи). Бот заводит запрос,
+-- демон делает расшифровку заново сразу, вне рабочих окон (started_at/done_at, ok, message),
+-- бот присылает человеку итог в ту же ветку (delivered_at).
+CREATE TABLE IF NOT EXISTS redo_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    recording_key TEXT NOT NULL,
+    user_id       TEXT NOT NULL,                    -- id пользователя в Tag (кому прислать итог)
+    channel_id    TEXT NOT NULL,                    -- его личка с ботом
+    root_id       TEXT,                             -- ветка, где нажата кнопка
+    requested_at  TEXT NOT NULL,
+    started_at    TEXT,
+    done_at       TEXT,
+    ok            INTEGER,                          -- 1 — расшифровано заново
+    message       TEXT,                             -- итог для человека
+    delivered_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_redo_open ON redo_requests(done_at, started_at);
+
 -- Пользователи (участники конференций) как отдельная сущность (не привязка к записи).
 --   id    — локальный автоинкремент; login — идентификатор из Толка (username = тело почты до @).
 --   notified_of_old_records_tag / _mail — булевы флаги (0/1): уведомлён ли пользователь
@@ -632,6 +650,98 @@ def create_admin_request(conn, kind, target, by, effective_at):
 def admin_request(conn, req_id):
     r = conn.execute("SELECT * FROM admin_requests WHERE id=?", (req_id,)).fetchone()
     return dict(r) if r else None
+
+
+@_locked
+def backup_to(conn, path):
+    """Целостная копия базы в файл path (средствами SQLite, вместе с изменениями из -wal)."""
+    dst = sqlite3.connect(path)
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+
+
+@_locked
+def has_records(conn):
+    """Есть ли в базе хоть одна запись."""
+    return conn.execute("SELECT 1 FROM recordings LIMIT 1").fetchone() is not None
+
+
+# ---- запросы «Повторить расшифровку» ------------------------------------------
+
+# Запрос человека по записи, который «занимает» его единственную повторную расшифровку: ещё
+# в работе либо удался. Неудачный (сбой, видео пропало) не считается — человек ничего не получил.
+_REDO_TAKEN = "recording_key=? AND user_id=? AND (done_at IS NULL OR ok=1)"
+
+
+@_locked
+def redo_used(conn, key, user_id):
+    """Заказывал ли человек повторную расшифровку этой записи (в работе или уже сделана)."""
+    return conn.execute(f"SELECT 1 FROM redo_requests WHERE {_REDO_TAKEN}",
+                        (key, user_id)).fetchone() is not None
+
+
+@_locked
+def add_redo_request(conn, key, user_id, channel_id, root_id, per_user_limit=3):
+    """Завести запрос. Один человек — одна повторная расшифровка каждой записи. Возвращает
+    (id, None) либо (None, причина отказа): 'dup' — его запрос по этой записи ещё в работе;
+    'used' — уже сделана; 'many' — у человека уже per_user_limit незавершённых."""
+    r = conn.execute(f"SELECT done_at FROM redo_requests WHERE {_REDO_TAKEN}",
+                     (key, user_id)).fetchone()
+    if r:
+        return None, "dup" if r[0] is None else "used"
+    n = conn.execute("SELECT COUNT(*) FROM redo_requests WHERE user_id=? AND done_at IS NULL",
+                     (user_id,)).fetchone()[0]
+    if n >= per_user_limit:
+        return None, "many"
+    cur = conn.execute(
+        "INSERT INTO redo_requests (recording_key, user_id, channel_id, root_id, requested_at) "
+        "VALUES (?,?,?,?,?)", (key, user_id, channel_id, root_id, _now()))
+    conn.commit()
+    return cur.lastrowid, None
+
+
+@_locked
+def redo_waiting(conn):
+    """Запросы, которые демон ещё не начал (сначала давние)."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM redo_requests WHERE started_at IS NULL AND done_at IS NULL "
+        "ORDER BY id").fetchall()]
+
+
+@_locked
+def redo_mark(conn, req_id, *, started=False, ok=None, message=None):
+    """Отметить запрос: started=True — демон начал; ok задан — закончил с итогом message."""
+    if started:
+        conn.execute("UPDATE redo_requests SET started_at=? WHERE id=?", (_now(), req_id))
+    if ok is not None:
+        conn.execute("UPDATE redo_requests SET done_at=?, ok=?, message=? WHERE id=?",
+                     (_now(), int(bool(ok)), message, req_id))
+    conn.commit()
+
+
+@_locked
+def redo_unstarted_after_restart(conn):
+    """Демон перезапустился: начатые, но не законченные запросы — снова в очередь."""
+    cur = conn.execute("UPDATE redo_requests SET started_at=NULL "
+                       "WHERE started_at IS NOT NULL AND done_at IS NULL")
+    conn.commit()
+    return cur.rowcount
+
+
+@_locked
+def redo_to_deliver(conn):
+    """Законченные запросы, итог которых бот ещё не прислал человеку."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM redo_requests WHERE done_at IS NOT NULL AND delivered_at IS NULL "
+        "ORDER BY id").fetchall()]
+
+
+@_locked
+def redo_delivered(conn, req_id):
+    conn.execute("UPDATE redo_requests SET delivered_at=? WHERE id=?", (_now(), req_id))
+    conn.commit()
 
 
 @_locked

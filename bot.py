@@ -18,6 +18,10 @@ bot.py — ИНТЕРАКТИВНЫЙ БОТ Tag (Mattermost). Этап B.
   3. «Поиск по названию» -> окно с полем для части названия; если нашлось несколько
      записей — сообщение с выпадающим списком найденного.
   4. Кнопки под уведомлением об удалении видео -> тексты этой записи в ветку.
+  5. «Повторить расшифровку» (под уведомлением и присланными файлами, пока видео в Толке) ->
+     запрос демону; он расшифрует запись заново сразу, вне окон, — личная копия, в архив не
+     пишется; бот пришлёт её файлы в ту же ветку (_redo_results_loop). Одна на человека для
+     каждой записи (неудачная не считается).
 
 Админу — в админ-боте (подробно — admin.py):
   archiever_admin или любое сообщение админ-боту — админ-панель: сводка, поиск и карточка любой записи, скачивание
@@ -48,6 +52,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import tempfile
 import threading
@@ -90,6 +95,8 @@ mm = MMClient(cfg.mm, verify=cfg.mm.verify)       # основной бот: у�
 amm = admin_client(cfg.mm, verify=cfg.mm.verify) if cfg.mm.admin_bot_token else mm
 talk = TalkClient()
 app = Flask(__name__)
+# личные копии повторных расшифровок: демон кладёт сюда (общая с ним папка data), бот отправляет
+REDO_DIR = os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "redo")
 
 
 # =========================================================================
@@ -184,7 +191,13 @@ def _deliver(client, channel_id, root_id, key, action, user_id):
                 if p and p not in paths:
                     paths.append(p)
             if paths:
-                client.post_files(channel_id, paths, message=caption, root_id=root_id)
+                # «Повторить расшифровку» — участнику (в личке с основным ботом), пока видео в
+                # Толке (после удаления расшифровывать не из чего) и если он её по этой записи
+                # ещё не заказывал (одна на человека)
+                props = ({"attachments": [{"actions": [mm.redo_button(key)]}]}
+                         if client is mm and not row.get("deleted")
+                         and not db.redo_used(conn, key, user_id) else None)
+                client.post_files(channel_id, paths, message=caption, root_id=root_id, props=props)
                 log.info("выдача: запись %s (%s) -> @%s, файлов: %d", key, action,
                          _user(user_id).get("username") or user_id, len(paths))
             else:
@@ -326,6 +339,89 @@ def _dlg_search(data, st, sub):
     mm.post(ch, message="", props={"attachments": [
         {"text": text, "actions": [mm.menu(T.MENU_PICK, "pick", options, do=kind)]}]})
     return None
+
+
+def _video_in_talk(key):
+    """Есть ли запись в Толке прямо сейчас (False — только при явном «нет»: 404). Сбой связи —
+    True: запрос всё равно примем, а не выйдет — демон так и скажет."""
+    try:
+        talk.recording_detail(key)
+        return True
+    except Exception as ex:
+        return getattr(getattr(ex, "response", None), "status_code", None) != 404
+
+
+def _daemon_paused():
+    """Стоят ли расшифровки на паузе из-за диска (снимок демона в meta)."""
+    try:
+        return bool(json.loads(db.get_meta(conn, "daemon_state") or "{}").get("asr_paused"))
+    except ValueError:
+        return False
+
+
+def _redo_request(user_id, channel_id, root, key):
+    row = db.get(conn, key) if key else None
+    if not row:
+        mm.post(channel_id, T.NOT_FOUND, root_id=root)
+        return
+    if not _may_read(user_id, key):
+        mm.post(channel_id, T.NOT_YOURS, root_id=root)
+        return
+    if row.get("deleted") or row.get("text_cleaned") or not _video_in_talk(key):
+        mm.post(channel_id, T.REDO_NO_VIDEO, root_id=root)
+        return
+    _, why = db.add_redo_request(conn, key, user_id, channel_id, root)
+    if why:
+        mm.post(channel_id, {"dup": T.REDO_DUP, "used": T.REDO_USED}.get(why, T.REDO_MANY), root_id=root)
+        return
+    log.info("повторная расшифровка: запись %s, просит @%s", key, _user(user_id).get("username") or user_id)
+    mm.post(channel_id, T.REDO_ACCEPTED + (T.REDO_WAIT_DISK if _daemon_paused() else ""), root_id=root)
+
+
+def _act_redo(data, ctx):
+    """«Повторить расшифровку» в карточке записи: если видео ещё в Толке — заводим запрос, демон
+    расшифрует запись заново сразу (вне рабочих окон), а новые файлы бот пришлёт в эту ветку.
+    В фоне: проверка Толка — сетевой запрос, а Tag ждёт быстрый ответ на нажатие."""
+    threading.Thread(target=_redo_request, daemon=True, args=(
+        data.get("user_id"), data["channel_id"], _thread_root(data.get("post_id")), ctx.get("key"))).start()
+
+
+def _redo_send(req):
+    """Итог одной повторной расшифровки — человеку в ту же ветку. Удалась — сообщение и файлы
+    личной копии (демон положил их в data/redo/<номер запроса>; в архиве их нет), после отправки
+    папку удаляем. Не удалась — причина."""
+    key, folder = req["recording_key"], os.path.join(REDO_DIR, str(req["id"]))
+    paths = sorted(os.path.join(folder, n) for n in os.listdir(folder)) if req["ok"] and \
+        os.path.isdir(folder) else []
+    if req["ok"] and not paths:
+        mm.post(req["channel_id"], T.REDO_FAILED.format(reason="файлы потерялись"), root_id=req["root_id"])
+        return
+    if not paths:
+        mm.post(req["channel_id"], req["message"] or "", root_id=req["root_id"])
+        return
+    row = db.get(conn, key) or {}
+    # кнопки «Повторить» под личной копией нет: повторная расшифровка — одна на человека
+    mm.post_files(req["channel_id"], paths, message=f"{req['message']}\n{record_label(row)}"
+                  if row else req["message"], root_id=req["root_id"])
+    shutil.rmtree(folder, ignore_errors=True)
+    log.info("повторная расшифровка %s отправлена (файлов: %d)", key, len(paths))
+
+
+def _redo_results_loop():
+    """Итоги повторных расшифровок (их делает демон) — человеку. Не дошло (Tag недоступен) —
+    повторим на следующем круге."""
+    while True:
+        try:
+            for req in db.redo_to_deliver(conn):
+                try:
+                    _redo_send(req)
+                except Exception as ex:
+                    log.warning("итог повторной расшифровки %s не отправлен: %s", req["recording_key"], ex)
+                    continue
+                db.redo_delivered(conn, req["id"])
+        except Exception as ex:
+            log.warning("итоги повторных расшифровок: сбой: %s", ex)
+        time.sleep(10)
 
 
 def _act_pick(data, ctx):
@@ -673,7 +769,7 @@ def _admin_requests_loop():
 
 
 # действие кнопки -> обработчик (data, ctx) -> ответ интеграции или None
-USER_ACTIONS = {"find": _act_find, "search": _act_search, "pick": _act_pick}
+USER_ACTIONS = {"find": _act_find, "search": _act_search, "pick": _act_pick, "redo": _act_redo}
 USER_ACTIONS.update({a: _act_file for a in FILE_KINDS + ("all", "video")})
 # действия панели -> обработчик (data, ctx, ник админа); права проверяются перед вызовом
 ADMIN_ACTIONS = {
@@ -685,6 +781,7 @@ ADMIN_ACTIONS = {
     "admkept": _adm_section(lambda by: admin.kept_view(conn, amm)),
     "admadmins": _adm_section(lambda by: admin.admins_view(conn, amm, cfg, by)),
     "admlog": _adm_section(lambda by: admin.log_view(conn)),
+    "admmemory": _adm_section(lambda by: admin.memory_view(conn, cfg)),
     "admaddadmin": _adm_add_admin, "admdeladmin": _adm_del_admin,
     "admblock": _adm_close_request, "admwithdraw": _adm_close_request,
     "admtransfer": _adm_transfer,
@@ -948,14 +1045,36 @@ async def _ws_loop(client, on_message):
 
 
 def _run_ws(client, on_message):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_ws_loop(client, on_message))
-    except Exception:
-        # сюда попадаем, только если сломалось само подключение (не сеть — её цикл переживает)
-        log.exception("WebSocket @%s остановлен: личные сообщения этому боту не принимаются",
-                      client.username)
+    """Поток websocket одного бота. Сеть его цикл переживает сам; если же сломалось что-то
+    другое — не умираем молча (бот перестал бы видеть личку, а /health отвечал бы «ok»), а
+    поднимаем цикл заново."""
+    while True:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_ws_loop(client, on_message))
+        except BaseException:
+            log.exception("WebSocket @%s: цикл упал — перезапускаю через %d с",
+                          client.username, _WS_RETRY_SEC)
+        finally:
+            loop.close()
+        time.sleep(_WS_RETRY_SEC)
+
+
+def _clean_tmp_videos():
+    """Видео, которое бот отдавал пользователю, лежит во временной папке до отправки; если бот
+    убили посреди отправки, файл остаётся (до гигабайтов). При старте их хозяев уже нет."""
+    tmp = tempfile.gettempdir()
+    n = 0
+    for name in os.listdir(tmp):
+        if name.endswith(".mp4"):
+            try:
+                os.remove(os.path.join(tmp, name))
+                n += 1
+            except OSError:
+                pass
+    if n:
+        log.warning("из %s убраны остатки отправки видео: %d файлов", tmp, n)
 
 
 # =========================================================================
@@ -1003,10 +1122,12 @@ def main():
         log.warning("ADMIN_USERNAME не задан — суперадмина нет, админ-панель и команды "
                     "(archiever_admin, restart_passed, newadmin/remember/delete) недоступны.")
 
+    _clean_tmp_videos()
     threading.Thread(target=_run_ws, args=(mm, _on_user_bot_message), daemon=True).start()
     if amm is not mm:
         threading.Thread(target=_run_ws, args=(amm, _on_admin_bot_message), daemon=True).start()
     threading.Thread(target=_admin_requests_loop, name="admin-requests", daemon=True).start()
+    threading.Thread(target=_redo_results_loop, name="redo-results", daemon=True).start()
     app.run(host="0.0.0.0", port=cfg.mm.button_port)
 
 

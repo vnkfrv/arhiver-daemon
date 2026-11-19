@@ -18,6 +18,7 @@ admin.py — АДМИН-ПАНЕЛЬ бота (команда archiever_admin в
 Транспорт и проверка прав — в bot.py.
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from typing import NamedTuple
 
 import config
 import db
+import resources
 import statuses
 import store
 import texts as T
@@ -148,6 +150,7 @@ def panel(conn, cfg, mm):
                 mm.button(T.BTN_ADMIN_ADMINS_PENDING.format(n=waiting) if waiting
                           else T.BTN_ADMIN_ADMINS, "admadmins"),
                 mm.button(T.BTN_ADMIN_LOG, "admlog"),
+                mm.button(T.BTN_ADMIN_MEMORY, "admmemory"),
                 mm.button(T.BTN_ADMIN_REFRESH, "admpanel", upd=1)]
     return [{"title": "🛠 Админ-панель архиватора", "fields": fields, "actions": actions,
              "footer": f"Обновлено {now.strftime('%d.%m.%Y %H:%M')} · последнее изменение "
@@ -397,6 +400,46 @@ def admins_view(conn, mm, cfg, viewer):
         actions.append(mm.menu(T.MENU_ADMIN_WITHDRAW, "admwithdraw", options(mine), view="admins"))
     atts = [{"title": f"👥 Администраторы: {len(rows)}", "text": text, "actions": actions}]
     return View(T.ADM_THREAD_ADMINS.format(n=len(rows)), atts)
+
+
+def memory_view(conn, cfg):
+    """Диск и ОЗУ ВМ прямо сейчас (бот в своём контейнере меряет ту же ВМ) и последний снимок
+    демона: пауза расшифровок, временные папки, когда он последний раз отметился."""
+    pct, used, total, free = resources.disk(cfg)
+    r = resources.ram()
+    try:
+        st = json.loads(db.get_meta(conn, "daemon_state") or "{}")
+    except ValueError:
+        st = {}
+    limit = cfg.disk_max_used_pct
+    if not limit:
+        pause = "контроль выключен (`DISK_MAX_USED_PCT=0`)"
+    elif st.get("asr_paused"):
+        pause = f"⏸ новые расшифровки на паузе: занято от {limit}%"
+    else:
+        pause = f"идут; пауза — при {limit}% и больше"
+    warn = "⚠️ " if limit and pct >= limit else ""
+    ram = ("не удалось узнать" if not r else
+           f"{'⚠️ ' if cfg.ram_alert_pct and r['used_pct'] >= cfg.ram_alert_pct else ''}"
+           f"занято {resources.gb(r['total'] - r['available'])} из {resources.gb(r['total'])} "
+           f"({r['used_pct']:.0f}%), доступно {resources.gb(r['available'])}; "
+           f"swap {resources.gb(r['swap_used'])} из {resources.gb(r['swap_total'])}")
+    seen = parse_dt(st.get("at"))
+    stale = not seen or (datetime.now(timezone.utc) - seen).total_seconds() > 300
+    daemon = ("⚠️ давно не отмечался — жив ли демон? (`docker compose ps`)" if stale else
+              f"отметился {_ago(st.get('at'))}; временных папок расшифровки: {st.get('tmp_dirs', '—')} "
+              f"(норма — не больше {2 * cfg.record_workers_asr})")
+    fields = [
+        {"title": "💽 SSD", "value": f"{warn}занято {resources.gb(used)} из {resources.gb(total)} "
+                                     f"({pct:.0f}%), свободно {resources.gb(free)}", "short": False},
+        {"title": "Расшифровки", "value": pause, "short": False},
+        {"title": "🧠 ОЗУ ВМ", "value": ram + (f" · тревога с {cfg.ram_alert_pct}%"
+                                              if cfg.ram_alert_pct else ""), "short": False},
+        {"title": "Демон", "value": daemon, "short": False},
+    ]
+    atts = [{"title": "💾 Диск и память ВМ", "fields": fields,
+             "footer": f"Сейчас: {datetime.now().astimezone().strftime('%d.%m.%Y %H:%M')}"}]
+    return View(T.ADM_THREAD_MEMORY, atts)
 
 
 def log_view(conn):
